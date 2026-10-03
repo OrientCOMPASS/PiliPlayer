@@ -174,9 +174,10 @@ class FloatingPlayerService {
       return false;
     }
 
-    SystemPipBridge
-      ..installHandler()
-      ..onEvent = _onPipEvent;
+    // 注意: 静态成员不能写成级联(`SystemPipBridge..installHandler()` 会被
+    // 解析成对 Type 对象调实例方法)
+    SystemPipBridge.installHandler();
+    SystemPipBridge.onEvent = _onPipEvent;
     _ignoreNativeEvents = false;
     final waiter = Completer<int>();
     _surfaceWaiter = waiter;

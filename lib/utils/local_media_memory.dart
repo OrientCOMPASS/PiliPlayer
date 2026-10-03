@@ -1,9 +1,10 @@
-import 'dart:convert' show jsonDecode, jsonEncode;
+import 'dart:convert' show jsonDecode, jsonEncode, utf8;
 
 import 'package:PiliPlus/plugin/pl_player/models/vr_projection.dart';
 import 'package:PiliPlus/utils/storage.dart';
 import 'package:archive/archive.dart' show getCrc32;
-import 'package:collection/collection.dart' show firstWhereOrNull;
+// firstWhereOrNull 是扩展方法, 要导入扩展本身而不是方法名
+import 'package:collection/collection.dart' show IterableExtension;
 import 'package:hive_ce/hive.dart';
 
 /// 单个本地/局域网视频"怎么播"的记忆(第二十轮 需求1)。

@@ -175,3 +175,52 @@ class GamepadPoller {
     }
   }
 }
+
+/// 摇杆 -> 视角的换算(纯函数, 便于单测)。
+///
+/// 摇杆不像手指拖拽自带位移量, 只能"角速度 × 时间"积分; 方向约定与
+/// [PlPlayerController.onVrLook] 保持一致的"看世界"语义:
+///   * 摇杆推右(axisX = +1) -> 视线向右 -> yaw **增大**
+///   * 摇杆推上(axisY = −1) -> 视线向上 -> pitch **减小**
+abstract final class GamepadMath {
+  /// 死区: 摇杆静置时的抖动(±0.1 很常见)不该让画面缓慢漂移
+  static const double deadZone = 0.15;
+
+  /// 满偏时的角速度(度/秒)。360° 片源约 3.3 秒转一圈, 跟手又不至于晕
+  static const double degPerSec = 110.0;
+
+  /// 单次积分的最大时间片: 掉帧/切后台回来时不要让视角"瞬移"
+  static const double maxDeltaSeconds = 0.25;
+
+  /// 死区 + 线性重映射: 刚过死区时增量从 0 平滑起步, 不会一跳一大步
+  static double axis(double value) {
+    if (value.isNaN || value.isInfinite) {
+      return 0;
+    }
+    final magnitude = value.abs();
+    if (magnitude <= deadZone) {
+      return 0;
+    }
+    final scaled = (magnitude - deadZone) / (1.0 - deadZone);
+    return value < 0 ? -scaled : scaled;
+  }
+
+  /// 一次积分转成的角度增量(度)。静止(两轴都在死区内)返回 (0, 0)。
+  ///
+  /// [dtSeconds] 现在由 VrControlLayer 的帧 Ticker 给出(真实帧间隔),
+  /// 所以 60/90/120Hz 的屏幕上转速一致, 不会因刷新率不同而变快变慢。
+  static ({double yaw, double pitch}) look(
+    double axisX,
+    double axisY,
+    double dtSeconds,
+  ) {
+    final x = axis(axisX);
+    final y = axis(axisY);
+    if ((x == 0 && y == 0) || dtSeconds <= 0) {
+      return (yaw: 0, pitch: 0);
+    }
+    final dt = dtSeconds > maxDeltaSeconds ? maxDeltaSeconds : dtSeconds;
+    final step = degPerSec * dt;
+    return (yaw: x * step, pitch: y * step);
+  }
+}

@@ -970,6 +970,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// (对比第十五轮出问题时的是 ~300 次/s)。
   bool _vrFrameScheduled = false;
 
+  /// 慢设备保护: `setProperty` 是**同步**跨线程往返(客户端 -> mpv core -> VO),
+  /// 万一单次写入接近一帧的耗时, 逐帧下发就会把 UI 线程吃满(第十五轮那次
+  /// 卡顿就是往返次数太多)。所以每次写入都掐一下表: 超过 [vrSlowWriteUs]
+  /// 就跳过下一帧(自动降到刷新率的一半), 快就恢复逐帧。
+  static const int vrSlowWriteUs = 6000;
+  bool _vrSkipNextFrame = false;
+
   void _initVrState(
     VrProjection? hint,
     String source, {
@@ -1416,7 +1423,14 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     _vrFrameScheduled = true;
     SchedulerBinding.instance.scheduleFrameCallback((_) {
       _vrFrameScheduled = false;
+      if (_vrSkipNextFrame) {
+        // 上一次写入太慢: 这帧不写(角度还是最新的, 下一帧再下发)
+        _vrSkipNextFrame = false;
+        return;
+      }
+      final watch = Stopwatch()..start();
       _applyVrProperties();
+      _vrSkipNextFrame = watch.elapsedMicroseconds > vrSlowWriteUs;
     });
   }
 

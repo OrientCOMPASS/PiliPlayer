@@ -100,7 +100,9 @@ class FloatingPlayerService {
             .resetApplicationScreenBrightness()
             .catchError((Object _) {}),
       );
-    } catch (_) {}
+    } catch (_) {
+      // 见上: 亮度还原失败不影响进小窗
+    }
     if (controller.controlsLock.value) {
       controller.onLockControl(false);
     }

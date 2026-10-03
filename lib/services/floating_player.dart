@@ -12,6 +12,7 @@ import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 import 'package:media_kit_video/media_kit_video.dart' show SimpleVideo;
+import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
 
 /// 应用内画中画(小窗播放)—— 第十九轮 需求3。
 ///
@@ -88,6 +89,18 @@ class FloatingPlayerService {
     if (controller.isFullScreen.value) {
       controller.triggerFullScreen(status: false);
     }
+    // 播放页里手势调过的屏幕亮度是"应用级"的, 正常退出由播放器 dispose 还原;
+    // 小窗这条路跳过了 dispose, 这里手动还一次, 否则接下来浏览应用会一直
+    // 停在播放页的亮度上。
+    // 平台没初始化/不支持就算了(同步抛与异步失败都吃掉), 不能因为这个
+    // 进不了小窗
+    try {
+      unawaited(
+        ScreenBrightnessPlatform.instance
+            .resetApplicationScreenBrightness()
+            .catchError((Object _) {}),
+      );
+    } catch (_) {}
     if (controller.controlsLock.value) {
       controller.onLockControl(false);
     }
@@ -350,10 +363,16 @@ class _FloatingPlayerWindowState extends State<_FloatingPlayerWindow> {
                   child: Stack(
                     fit: StackFit.expand,
                     children: [
+                      // SimpleVideo 会按片源的**逻辑像素尺寸**给自己定尺寸,
+                      // 直接塞进 StackFit.expand 会被强行拉满(竖屏片源就变形了),
+                      // 所以套一层 FittedBox.contain 做等比letterbox。
                       if (videoController != null)
-                        SimpleVideo(
-                          controller: videoController,
-                          fill: Colors.black,
+                        FittedBox(
+                          fit: BoxFit.contain,
+                          child: SimpleVideo(
+                            controller: videoController,
+                            fill: Colors.black,
+                          ),
                         )
                       else
                         const ColoredBox(color: Colors.black),

@@ -117,25 +117,29 @@ abstract final class GamepadBridge {
   };
 }
 
-/// 轮询器: VR 操作模式挂一个, 把右摇杆读数按固定节奏喂给回调。
+/// 摇杆采样器: VR 操作模式挂一个, 只负责"把最新读数取回来"。
 ///
-/// 单独抽出来是为了让 `VrControlLayer` 的 build/dispose 保持干净, 也方便
-/// 在测试里替换节奏。
+/// 第二十轮 需求6 的关键分工: **采样与积分解耦**。
+/// 旧实现是"取到一次读数就推进一次视角", 于是角度只在采样到达的那一刻动
+/// (50Hz, 还要再过一层 30ms 节流 ≈ 33Hz), 而陀螺仪是 native 逐帧跑的 ——
+/// 真机上手柄环视就是一格一格的。现在采样只管刷新缓存, 推进由
+/// `VrControlLayer` 的帧 Ticker 每帧用最新采样 × 真实帧间隔来积分,
+/// 更新率与屏幕刷新率一致。
 class GamepadPoller {
   GamepadPoller({
-    this.interval = const Duration(milliseconds: 20),
-    required this.onAxes,
+    this.interval = const Duration(milliseconds: 10),
+    required this.onSample,
   });
 
-  /// 采样间隔。20ms(≈50Hz)足够跟手, 又不会把主线程塞满
+  /// 采样间隔。10ms(≈100Hz)主要是为了压低"手柄动了但 Dart 还不知道"的延迟;
+  /// 平滑度由帧积分保证, 不靠这个频率。
   final Duration interval;
 
-  /// 每次拿到**新鲜**读数时回调(rightX, rightY, 距上次采样的秒数)
-  final void Function(double rightX, double rightY, double dtSeconds) onAxes;
+  /// 拿到**新鲜**读数时回调(rightX, rightY); 陈旧/静止不回调
+  final void Function(double rightX, double rightY) onSample;
 
   Timer? _timer;
   bool _busy = false;
-  int _lastMs = 0;
 
   bool get isRunning => _timer != null;
 
@@ -143,7 +147,6 @@ class GamepadPoller {
     if (_timer != null || !GamepadBridge.isSupported) {
       return;
     }
-    _lastMs = DateTime.now().millisecondsSinceEpoch;
     _timer = Timer.periodic(interval, (_) => unawaited(_tick()));
   }
 
@@ -155,7 +158,7 @@ class GamepadPoller {
   }
 
   Future<void> _tick() async {
-    // 上一帧的通道调用还没回来就跳过: 宁可掉一帧, 也不要让请求排队
+    // 上一次通道调用还没回来就跳过: 宁可掉一次采样, 也不要让请求排队
     // (排队会造成"松手之后视角还在飘")
     if (_busy) {
       return;
@@ -163,61 +166,12 @@ class GamepadPoller {
     _busy = true;
     try {
       final axes = await GamepadBridge.read();
-      final now = DateTime.now().millisecondsSinceEpoch;
-      final dt = (now - _lastMs) / 1000.0;
-      _lastMs = now;
       if (_timer == null || axes.stale) {
         return;
       }
-      onAxes(axes.rightX, axes.rightY, dt);
+      onSample(axes.rightX, axes.rightY);
     } finally {
       _busy = false;
     }
-  }
-}
-
-/// 摇杆 -> 视角的换算(纯函数, 便于单测)。
-///
-/// 摇杆不像手指拖拽自带位移量, 只能"角速度 × 时间"积分; 方向约定与
-/// [PlPlayerController.onVrLook] 保持一致的"看世界"语义:
-///   * 摇杆推右(axisX = +1) -> 视线向右 -> yaw **增大**
-///   * 摇杆推上(axisY = −1) -> 视线向上 -> pitch **减小**
-abstract final class GamepadMath {
-  /// 死区: 摇杆静置时的抖动(±0.1 很常见)不该让画面缓慢漂移
-  static const double deadZone = 0.15;
-
-  /// 满偏时的角速度(度/秒)。360° 片源约 3.3 秒转一圈, 跟手又不至于晕
-  static const double degPerSec = 110.0;
-
-  /// 单次采样的最大时间片: 掉帧/切后台回来时不要让视角"瞬移"
-  static const double maxDeltaSeconds = 0.25;
-
-  /// 死区 + 线性重映射: 刚过死区时增量从 0 平滑起步, 不会一跳一大步
-  static double axis(double value) {
-    if (value.isNaN || value.isInfinite) {
-      return 0;
-    }
-    final magnitude = value.abs();
-    if (magnitude <= deadZone) {
-      return 0;
-    }
-    final scaled = (magnitude - deadZone) / (1.0 - deadZone);
-    return value < 0 ? -scaled : scaled;
-  }
-
-  /// 一次采样转成的角度增量(度)。静止(两轴都在死区内)返回 (0, 0)。
-  static ({double yaw, double pitch}) look(
-    double axisX,
-    double axisY,
-    double dtSeconds,
-  ) {
-    final x = axis(axisX);
-    final y = axis(axisY);
-    if ((x == 0 && y == 0) || dtSeconds <= 0) {
-      return (yaw: 0, pitch: 0);
-    }
-    final dt = dtSeconds > maxDeltaSeconds ? maxDeltaSeconds : dtSeconds;
-    final step = degPerSec * dt;
-    return (yaw: x * step, pitch: y * step);
   }
 }

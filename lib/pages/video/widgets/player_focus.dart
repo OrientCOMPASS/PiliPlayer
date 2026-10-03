@@ -59,6 +59,23 @@ class PlayerFocus extends StatelessWidget {
     );
   }
 
+  /// VR 操作模式下方向键对应的视角步进动作; 不是步进键返回 null。
+  ///
+  /// 方向与右摇杆/单指拖拽一致: 右 = 看右(yaw 增大), 上 = 看上(pitch 减小)。
+  VoidCallback? _vrStepAction(LogicalKeyboardKey key) {
+    const step = PlPlayerController.vrStepDeg;
+    return switch (key) {
+      LogicalKeyboardKey.arrowLeft =>
+        () => plPlayerController.vrStep(dyaw: -step),
+      LogicalKeyboardKey.arrowRight => () => plPlayerController.vrStep(dyaw: step),
+      LogicalKeyboardKey.arrowUp =>
+        () => plPlayerController.vrStep(dpitch: -step),
+      LogicalKeyboardKey.arrowDown =>
+        () => plPlayerController.vrStep(dpitch: step),
+      _ => null,
+    };
+  }
+
   bool get isFullScreen => plPlayerController.isFullScreen.value;
   bool get hasPlayer => plPlayerController.videoPlayerController != null;
 
@@ -100,7 +117,21 @@ class PlayerFocus extends StatelessWidget {
     // 弹出播放器 UI 只会挡住画面与 VR 按钮(需求原文: 手柄操作不应唤起
     // 播放器 UI)。摇杆部分见 VrControlLayer 的 GamepadPoller。
     if (plPlayerController.vrControlMode.value) {
-      // 只认 KeyDownEvent: 长按产生的 KeyRepeatEvent 不会重复触发
+      // 十字键 = 视角步进, **长按连续**(第二十轮 需求3)。
+      // 安卓把 KEYCODE_DPAD_* 映射成方向键, 所以手柄十字键与键盘方向键
+      // 走的是同一条分支。VR 操作模式下这两个键不再做快退快进/音量:
+      // 环视优先, 进退交给 L1/R1(±60s), 音量交给屏幕 UI。
+      if (_vrStepAction(key) case final action?) {
+        if (event is KeyDownEvent) {
+          plPlayerController.startKeyRepeat(action);
+        } else if (event is KeyUpEvent) {
+          plPlayerController.stopKeyRepeat();
+        }
+        // KeyRepeatEvent(系统按键重复)交给上面的定时器, 不再重复触发
+        return true;
+      }
+      // △/Y = 视角摆正, □/X = 切换眼位: 都是单次动作, 只认 KeyDownEvent,
+      // 长按产生的 KeyRepeatEvent 直接吃掉(眼位另有冷却兜底)
       if (key == LogicalKeyboardKey.gameButtonY) {
         if (event is KeyDownEvent) {
           plPlayerController.resetVrView();

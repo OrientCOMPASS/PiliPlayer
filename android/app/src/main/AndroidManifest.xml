@@ -236,6 +236,25 @@
                     android:path="/launch" />
             </intent-filter>
         </activity>
+        <!-- 第二十轮 需求2: 系统画中画专用 Activity。
+             系统 PiP 收起的是"调用它的那个 Activity", 主 Activity 是
+             FlutterActivity, 它一进 PiP 整个应用就都被塞进小窗、没法继续浏览。
+             这里照搬 moonlight-android 的结构(串流跑在独立的 Game Activity):
+             画面由 mpv 直接渲染到本 Activity 的 SurfaceView, 主 Activity 留在
+             原任务里照常可点可逛。singleTask + 独立 taskAffinity 让它自己一个
+             任务, excludeFromRecents/noHistory 与 moonlight 一致。 -->
+        <activity
+            android:name=".PipActivity"
+            android:configChanges="orientation|keyboardHidden|keyboard|screenSize|smallestScreenSize|locale|layoutDirection|fontScale|screenLayout|density|uiMode"
+            android:excludeFromRecents="true"
+            android:exported="false"
+            android:launchMode="singleTask"
+            android:noHistory="true"
+            android:resizeableActivity="true"
+            android:supportsPictureInPicture="true"
+            android:taskAffinity="${applicationId}.pip"
+            android:theme="@android:style/Theme.Black.NoTitleBar.Fullscreen" />
+
         <provider
             android:name=".BiliDocumentsProvider"
             android:permission="android.permission.MANAGE_DOCUMENTS"

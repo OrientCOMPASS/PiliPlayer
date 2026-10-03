@@ -62,6 +62,8 @@ import 'package:PiliPlus/utils/extension/iterable_ext.dart';
 import 'package:PiliPlus/utils/extension/nested_scroll_ext.dart';
 import 'package:PiliPlus/utils/extension/num_ext.dart';
 import 'package:PiliPlus/utils/extension/size_ext.dart';
+import 'package:PiliPlus/plugin/pl_player/models/vr_projection.dart';
+import 'package:PiliPlus/utils/local_media_memory.dart';
 import 'package:PiliPlus/utils/local_media_progress.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/platform_utils.dart';
@@ -388,6 +390,7 @@ class VideoDetailController extends GetxController
     }
     _lastLocalProgressSavedMs = ms;
     _saveLocalProgress(position);
+    saveLocalSettingsMemory();
   }
 
   void _saveLocalProgress(Duration position) {
@@ -403,6 +406,10 @@ class VideoDetailController extends GetxController
     );
   }
 
+  /// 这个视频上次"怎么播"的记忆(倍速 / VR 布局 / 眼位 / 视场角 / 陀螺仪)。
+  /// 位置记忆仍走 [LocalMediaProgress]。见 `utils/local_media_memory.dart`。
+  LocalMediaSettings? _localMemory;
+
   /// 本地/局域网媒体: 播放地址来自文件系统或 URL, 全程不请求 B 站接口。
   ///
   /// [startAt] 优先于本机续播记录: 应用内画中画(小窗)回到播放页时带的是
@@ -416,6 +423,10 @@ class VideoDetailController extends GetxController
   }) {
     localItem = item;
     localPlayUrl = playUrl ?? LocalMediaService.playbackUrl(item);
+    // fd:// (系统分享打开)的地址每次会话都不同, 记不住也不该记
+    _localMemory = item.uri.startsWith('fd://')
+        ? null
+        : LocalMediaMemory.get(item.uri);
     firstVideo = VideoItem(
       id: 0,
       // 本地文件没有 B 站画质概念, 这里只是占位(简介面板不展示画质)
@@ -426,6 +437,65 @@ class VideoDetailController extends GetxController
     defaultST = startAt ?? LocalMediaProgress.get(item.uri);
     _lastLocalProgressSavedMs = 0;
     _setVideoHeight();
+  }
+
+  /// 把记住的播放设置应用上去(倍速 / VR 眼位 / 视场角 / 陀螺仪)。
+  ///
+  /// VR **布局**不在这儿: 它是 [playerInit] 传给 `setDataSource(vrProjection:)`
+  /// 的 hint, 装载阶段就生效(避免先按平面渲染一帧再切)。
+  void applyLocalSettingsMemory() {
+    final memory = _localMemory;
+    if (memory == null) {
+      return;
+    }
+    final ctr = plPlayerController;
+    if (memory.speed case final speed?) {
+      if ((speed - ctr.playbackSpeed).abs() > 0.01) {
+        unawaited(ctr.setPlaybackSpeed(speed));
+      }
+    }
+    if (memory.vrEye case final eye?) {
+      unawaited(ctr.setVrEye(eye));
+    }
+    if (memory.vrFov case final fov?) {
+      ctr.setVrFov(fov);
+    }
+    if (memory.vrGyro case final gyro?) {
+      // persist: false —— 这是"这个视频上次怎么播", 不改全局默认
+      ctr.setVrGyro(gyro, persist: false, toast: false);
+    }
+  }
+
+  /// 记下这个视频"怎么播"(与位置记忆同一节奏: 播放中每 5 秒 + 退出/切集时)。
+  ///
+  /// 只记**偏离默认**的部分: 倍速与全局默认一致时不写(否则以后改全局默认,
+  /// 看过的老视频还卡在旧值上); 普通 2D 片源不写 VR 块(否则会把"自动识别"
+  /// 钉死成 off)。用户手动选过「强制平面」的情况靠 `vrUserTouched` 兜住。
+  void saveLocalSettingsMemory() {
+    if (!isLocalMedia) {
+      return;
+    }
+    final uri = localItem.uri;
+    if (uri.startsWith('fd://')) {
+      return;
+    }
+    final ctr = plPlayerController;
+    final speed = ctr.playbackSpeed;
+    final vrOn = ctr.vrProjection.value != VrProjection.off;
+    LocalMediaMemory.put(
+      uri,
+      LocalMediaSettings(
+        speed: (speed - Pref.playSpeedDefault).abs() > 0.01 ? speed : null,
+        vrProjection: vrOn
+            ? ctr.vrProjection.value
+            : ctr.vrUserTouched
+            ? ctr.vrRequested.value
+            : null,
+        vrEye: vrOn ? ctr.vrEye.value : null,
+        vrFov: vrOn ? ctr.vrView.value.fov : null,
+        vrGyro: vrOn ? ctr.vrGyroEnabled.value : null,
+      ),
+    );
   }
 
   /// 自动加载与视频文件名匹配的外置字幕（本地/局域网媒体）。
@@ -923,6 +993,9 @@ class VideoDetailController extends GetxController
         } else {
           // 本地视频: 自动找同目录里与视频同名的外置字幕
           unawaited(_autoloadLocalSubtitles());
+          // 上次这个视频的倍速/眼位/视场角/陀螺仪(VR 布局在 setDataSource
+          // 阶段就已经作为 hint 生效了)
+          applyLocalSettingsMemory();
         }
       },
       width: firstVideo.width,
@@ -933,6 +1006,9 @@ class VideoDetailController extends GetxController
       // VR 自动识别要靠文件名里的关键词(360/sbs/tb/全景...), 而 SMB 播放
       // 走本机回环代理, 播放地址里没有原文件名, 必须把条目名传进去
       mediaName: isLocalMedia ? localItem.name : null,
+      // 记住过 VR 布局就直接用, 不再靠文件名/元数据猜(需求1):
+      // 用户手动纠正过的片源(名字里没有 360/sbs 关键词那种)下次不用再选一遍
+      vrProjection: isLocalMedia ? _localMemory?.vrProjection : null,
     );
 
     if (isClosed) return;
@@ -1444,6 +1520,8 @@ class VideoDetailController extends GetxController
     if (isFileSource) {
       cacheLocalProgress();
     }
+    // 切集/换视频之前, 把"上一条"的播放设置记下来(此时 localItem 还是旧的)
+    saveLocalSettingsMemory();
 
     playedTime = null;
     defaultST = null;

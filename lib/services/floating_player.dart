@@ -1,4 +1,4 @@
-import 'dart:async' show Timer, unawaited;
+import 'dart:async' show Completer, StreamSubscription, Timer, unawaited;
 import 'dart:io' show Platform;
 
 import 'package:PiliPlus/models/common/video/source_type.dart';
@@ -6,14 +6,27 @@ import 'package:PiliPlus/models/local_media/local_media_item.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/services/saf/saf_bridge.dart' show SafFdRegistry;
+import 'package:PiliPlus/services/system_pip.dart';
+import 'package:PiliPlus/utils/android/android_helper.dart';
 import 'package:PiliPlus/utils/local_media_progress.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
+import 'package:media_kit/media_kit.dart' show Player;
 import 'package:media_kit_video/media_kit_video.dart' show SimpleVideo;
 import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
+
+/// "播放页已经出栈、播放器还在播"的两种呈现方式。
+enum DetachedPlaybackMode {
+  /// 应用内浮窗(插在 root Overlay 上): 不出应用, 不依赖系统 PiP
+  inAppWindow,
+
+  /// **系统画中画**: 画面交给独立的 PiP Activity(见 `PipActivity.kt`),
+  /// 系统管理的小窗(可拖到屏幕任意位置、可出应用、有系统媒体按钮)
+  systemPip,
+}
 
 /// 应用内画中画(小窗播放)—— 第十九轮 需求3。
 ///
@@ -56,11 +69,36 @@ class FloatingPlayerService {
   LocalMediaItem? _progressItem;
   Timer? _progressTimer;
 
+  /// 当前呈现方式(应用内浮窗 / 系统画中画)
+  DetachedPlaybackMode _mode = DetachedPlaybackMode.inAppWindow;
+
+  DetachedPlaybackMode get mode => _mode;
+
+  // ---- 系统画中画专用状态 ----
+
+  /// PiP 窗口 SurfaceView 的 wid(mpv `--wid` 的值)
+  int _pipWid = 0;
+
+  /// 交接前 Flutter 纹理那边的 wid / vo, 退出 PiP 时要还原回去
+  int _flutterWid = 0;
+  String _flutterVo = 'gpu';
+
+  /// 等 PiP Activity 的 surface 就绪
+  Completer<int>? _surfaceWaiter;
+
+  /// Dart 主动收尾(展开/关闭)期间, 忽略 native 再推来的事件
+  bool _ignoreNativeEvents = false;
+
+  StreamSubscription<dynamic>? _videoParamsSub;
+
   bool get isActive => active.value;
 
-  /// 从播放页收起成小窗。[context] 用于把播放页弹出栈。
+  bool get isSystemPip => _mode == DetachedPlaybackMode.systemPip;
+
+  /// 从播放页收起成小窗。[navigator] 用来把播放页弹出栈
+  /// (调用方在**同步**阶段就把它取好, 免得 await 之后再用 BuildContext)。
   void enter({
-    required BuildContext context,
+    required NavigatorState? navigator,
     required PlPlayerController controller,
     required String title,
     required Map<dynamic, dynamic> restoreArgs,
@@ -79,6 +117,7 @@ class FloatingPlayerService {
       return;
     }
 
+    _mode = DetachedPlaybackMode.inAppWindow;
     _controller = controller;
     _title = title;
     _restoreArgs = Map<dynamic, dynamic>.of(restoreArgs);
@@ -86,27 +125,9 @@ class FloatingPlayerService {
     // 播放页 dispose 时据此放过播放器(否则出栈即销毁)
     controller.floatingKeepAlive = true;
 
-    // 全屏(横屏锁定)状态下先退回窗口态: 小窗播放时不该把整个应用锁在横屏
-    if (controller.isFullScreen.value) {
-      controller.triggerFullScreen(status: false);
-    }
-    // 播放页里手势调过的屏幕亮度是"应用级"的, 正常退出由播放器 dispose 还原;
-    // 小窗这条路跳过了 dispose, 这里手动还一次, 否则接下来浏览应用会一直
-    // 停在播放页的亮度上。
-    // 平台没初始化/不支持就算了(同步抛与异步失败都吃掉), 不能因为这个
-    // 进不了小窗
-    try {
-      unawaited(
-        ScreenBrightnessPlatform.instance
-            .resetApplicationScreenBrightness()
-            .catchError((Object _) {}),
-      );
-    } catch (_) {
-      // 见上: 亮度还原失败不影响进小窗
-    }
-    if (controller.controlsLock.value) {
-      controller.onLockControl(false);
-    }
+    _leaveFullScreen(controller);
+    _resetBrightness();
+    _suppressHostAutoPip();
 
     if (!_insertEntry()) {
       controller.floatingKeepAlive = false;
@@ -118,14 +139,230 @@ class FloatingPlayerService {
     _startProgressSaver(controller, _restoreArgs);
     // 播放页马上就要出栈, 它占的那份引用计数交给小窗(见方法注释)
     controller.releasePageSlotForFloating();
-
     // 播放页出栈 —— 下面的页面立刻可见可点, 这就是"只收起播放页"
-    final navigator = Navigator.maybeOf(context, rootNavigator: true);
+    _popPage(navigator);
+  }
+
+  /// 系统画中画(第二十轮 需求2): 画面交给独立的 `PipActivity`,
+  /// 主 Activity 留在原任务里 —— 与 moonlight-android 同一套结构。
+  ///
+  /// 播放器**不重建**: 只是把 mpv 的渲染目标(`--wid`)从 media_kit 在 Flutter
+  /// 纹理注册表里创建的 Surface, 换成 PiP 窗口 SurfaceView 的 Surface
+  /// (顺序 `vo=null -> wid -> vo=gpu`, 照抄 media_kit 自己的做法)。
+  /// 所以不重新拉流、不丢进度、不重新缓冲。
+  ///
+  /// 返回 false 表示这条路走不通(设备/系统不允许、surface 没起来、读不到
+  /// 当前 wid), 调用方应退回"整应用系统 PiP"或应用内浮窗。
+  Future<bool> enterSystemPip({
+    required NavigatorState? navigator,
+    required PlPlayerController controller,
+    required String title,
+    required Map<dynamic, dynamic> restoreArgs,
+    String restoreRoute = '/videoV',
+  }) async {
+    if (active.value || !SystemPipBridge.isSupported) {
+      return false;
+    }
+    final player = controller.videoPlayerController;
+    if (player == null || controller.videoController == null) {
+      return false;
+    }
+    // 交接前必须记住 Flutter 纹理那边的 wid, 否则退出 PiP 时回不去
+    final flutterWid = int.tryParse(MpvWidHandoff.read(player, 'wid') ?? '') ?? 0;
+    final flutterVo = MpvWidHandoff.read(player, 'vo') ?? 'gpu';
+    if (flutterWid <= 0) {
+      return false;
+    }
+
+    SystemPipBridge
+      ..installHandler()
+      ..onEvent = _onPipEvent;
+    _ignoreNativeEvents = false;
+    final waiter = Completer<int>();
+    _surfaceWaiter = waiter;
+
+    final state = player.state;
+    var ratioW = state.width > 0 ? state.width : 16;
+    var ratioH = state.height > 0 ? state.height : 9;
+    // 系统对 PiP 宽高比有硬限制(约 1:2.39 ~ 2.39:1), 超出会抛异常;
+    // 兜底规则与 PageUtils.enterPip 一致
+    final ratio = ratioW / ratioH;
+    if (ratio < 1 / 2.39 || ratio > 2.39) {
+      if (ratioH > ratioW) {
+        ratioW = 9;
+        ratioH = 16;
+      } else {
+        ratioW = 16;
+        ratioH = 9;
+      }
+    }
+    if (!await SystemPipBridge.start(
+      width: ratioW,
+      height: ratioH,
+      title: title,
+    )) {
+      _surfaceWaiter = null;
+      return false;
+    }
+    final pipWid = await waiter.future.timeout(
+      const Duration(seconds: 4),
+      onTimeout: () => 0,
+    );
+    _surfaceWaiter = null;
+    if (pipWid <= 0) {
+      unawaited(SystemPipBridge.stop());
+      return false;
+    }
+
+    _mode = DetachedPlaybackMode.systemPip;
+    _controller = controller;
+    _title = title;
+    _restoreArgs = Map<dynamic, dynamic>.of(restoreArgs);
+    _restoreRoute = restoreRoute;
+    _flutterWid = flutterWid;
+    _flutterVo = flutterVo;
+    _pipWid = pipWid;
+    controller.floatingKeepAlive = true;
+
+    // 画面搬进 PiP 窗口
+    MpvWidHandoff.attach(player, pipWid, vo: flutterVo);
+    _watchVideoParams(player);
+
+    _leaveFullScreen(controller);
+    _resetBrightness();
+    _suppressHostAutoPip();
+
+    active.value = true;
+    _startProgressSaver(controller, _restoreArgs);
+    controller.releasePageSlotForFloating();
+    _popPage(navigator);
+    return true;
+  }
+
+  /// 关掉主 Activity 的"自动进系统 PiP"。
+  ///
+  /// 不设的话会有两个 PiP: 启动 PipActivity 时 MainActivity 退到后台,
+  /// 若它此前按「自动画中画」设置挂了 `setAutoEnterEnabled(true)`(或
+  /// onUserLeaveHint 回调), 它自己也会缩进一个系统小窗。
+  void _suppressHostAutoPip() {
+    if (!Platform.isAndroid) {
+      return;
+    }
+    try {
+      PiliAndroidHelper.disableAutoEnterPip();
+    } catch (_) {
+      // JNI 没就绪之类: 最多是多一个小窗, 不影响主流程
+    }
+  }
+
+  /// 播放页出栈(两种模式共用)
+  void _popPage(NavigatorState? navigator) {
     if (navigator != null) {
       navigator.pop();
     } else {
       Get.back<dynamic>();
     }
+  }
+
+  /// 全屏(横屏锁定)状态下先退回窗口态: 播放页都要出栈了, 不该把整个应用
+  /// 锁在横屏上
+  void _leaveFullScreen(PlPlayerController controller) {
+    if (controller.isFullScreen.value) {
+      controller.triggerFullScreen(status: false);
+    }
+    if (controller.controlsLock.value) {
+      controller.onLockControl(false);
+    }
+  }
+
+  /// 播放页里手势调过的屏幕亮度是"应用级"的, 正常退出由播放器 dispose 还原;
+  /// 这两条路都跳过了 dispose, 这里手动还一次, 否则接下来浏览应用会一直停在
+  /// 播放页的亮度上。平台没初始化/不支持就算了, 不能因为这个进不了小窗。
+  void _resetBrightness() {
+    try {
+      unawaited(
+        ScreenBrightnessPlatform.instance
+            .resetApplicationScreenBrightness()
+            .catchError((Object _) {}),
+      );
+    } catch (_) {
+      // 见上
+    }
+  }
+
+  // ==================== 系统画中画的事件与 surface 交接 ====================
+
+  void _onPipEvent(SystemPipEvent event) {
+    if (_ignoreNativeEvents) {
+      return;
+    }
+    final player = _controller?.videoPlayerController;
+    switch (event.type) {
+      case SystemPipEventType.surfaceReady:
+        final waiter = _surfaceWaiter;
+        if (waiter != null && !waiter.isCompleted) {
+          waiter.complete(event.wid);
+          return;
+        }
+        // PiP 窗口尺寸变化会让系统重建 surface: 用新 wid 重新接上
+        if (isSystemPip && event.wid > 0) {
+          _pipWid = event.wid;
+          MpvWidHandoff.attach(player, event.wid, vo: _flutterVo);
+        }
+      case SystemPipEventType.surfaceLost:
+        // surface 马上失效, 先把 mpv 摘下来(native 侧会等我们 ~260ms)
+        MpvWidHandoff.detach(player);
+      case SystemPipEventType.expanded:
+        // 用户点了 PiP 窗口的"展开": 交还播放页
+        unawaited(restore());
+      case SystemPipEventType.closed:
+        // PiP 窗口被划掉/点 X: 播放到此为止
+        close();
+      case SystemPipEventType.failed:
+        final waiter = _surfaceWaiter;
+        if (waiter != null && !waiter.isCompleted) {
+          waiter.complete(0);
+        }
+      case SystemPipEventType.surfaceChanged:
+      case SystemPipEventType.pipModeChanged:
+      case SystemPipEventType.unknown:
+        break;
+    }
+  }
+
+  /// media_kit 的 AndroidVideoController 在 videoParams 变化时会把 `wid`
+  /// 抢回它自己的 Flutter surface(它并不知道画面被借走了)。PiP 期间跟着补一刀
+  /// 把画面夺回来, 否则片源中途改分辨率会让 PiP 窗口黑屏。
+  void _watchVideoParams(Player player) {
+    _videoParamsSub?.cancel();
+    _videoParamsSub = player.stream.videoParams.listen((_) {
+      if (!isSystemPip || _pipWid <= 0) {
+        return;
+      }
+      final wid = _pipWid;
+      final vo = _flutterVo;
+      // 让 media_kit 那个(注册得更早的)listener 先跑完
+      Timer(const Duration(milliseconds: 150), () {
+        if (isSystemPip && _pipWid == wid) {
+          MpvWidHandoff.attach(_controller?.videoPlayerController, wid, vo: vo);
+        }
+      });
+    });
+  }
+
+  /// 把画面还给 Flutter 纹理(退出系统画中画)
+  void _restoreFlutterSurface(PlPlayerController controller) {
+    _videoParamsSub?.cancel();
+    _videoParamsSub = null;
+    if (_flutterWid > 0) {
+      MpvWidHandoff.attach(
+        controller.videoPlayerController,
+        _flutterWid,
+        vo: _flutterVo,
+      );
+    }
+    _pipWid = 0;
+    _flutterWid = 0;
   }
 
   /// 回到播放页(原位续播)
@@ -139,6 +376,13 @@ class FloatingPlayerService {
     final progressMs = controller.positionInMilliseconds;
     final cid = args['cid'];
     final route = _restoreRoute;
+    if (isSystemPip) {
+      // 接下来 finish PiP 窗口时 native 还会推 onClosed/onSurfaceLost 过来,
+      // 那是我们自己发起的收尾, 不能再当成"用户关掉了窗口"去销毁播放器
+      _ignoreNativeEvents = true;
+      _restoreFlutterSurface(controller);
+      unawaited(SystemPipBridge.stop());
+    }
     _teardownEntry(saveProgress: true);
     // 交还给播放页: 页面会正常走 setDataSource(单例播放器复用),
     // 因此这里必须清掉保活标记, 否则用户再退出时播放器不会被销毁
@@ -160,9 +404,19 @@ class FloatingPlayerService {
     }
   }
 
-  /// 关闭小窗并销毁播放器
+  /// 关闭小窗(应用内浮窗 / 系统画中画)并销毁播放器
   void close() {
     final controller = _controller;
+    if (isSystemPip) {
+      _ignoreNativeEvents = true;
+      // 先从 PiP 的 surface 上摘下来再销毁, 免得 mpv 往已销毁的窗口渲染
+      MpvWidHandoff.detach(controller?.videoPlayerController);
+      _videoParamsSub?.cancel();
+      _videoParamsSub = null;
+      _pipWid = 0;
+      _flutterWid = 0;
+      unawaited(SystemPipBridge.stop());
+    }
     _teardownEntry(saveProgress: true);
     _restoreArgs = null;
     if (controller != null) {
@@ -210,6 +464,8 @@ class FloatingPlayerService {
   void _teardownEntry({bool saveProgress = false}) {
     _stopProgressSaver(save: saveProgress);
     active.value = false;
+    _mode = DetachedPlaybackMode.inAppWindow;
+    _surfaceWaiter = null;
     final entry = _entry;
     _entry = null;
     if (entry != null) {

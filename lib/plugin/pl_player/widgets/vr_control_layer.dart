@@ -37,7 +37,8 @@ class VrControlLayer extends StatefulWidget {
   State<VrControlLayer> createState() => _VrControlLayerState();
 }
 
-class _VrControlLayerState extends State<VrControlLayer> {
+class _VrControlLayerState extends State<VrControlLayer>
+    with SingleTickerProviderStateMixin {
   /// 双指缩放开始时的视场角, 缩放按该基准做绝对映射(避免累积漂移)
   double _fovBase = VrViewState.kVrDefaultFov;
 
@@ -46,12 +47,22 @@ class _VrControlLayerState extends State<VrControlLayer> {
   /// 给 core/VO 线程添堵)
   Timer? _hudTimer;
 
-  /// 手柄右摇杆轮询(需求5): 摇杆是 MotionEvent 模拟轴, 不会自动进 Dart,
+  /// 手柄右摇杆采样(需求5): 摇杆是 MotionEvent 模拟轴, 不会自动进 Dart,
   /// 只能按固定节奏去 native 侧取最新读数(见 `utils/gamepad.dart`)。
-  /// 只在本层挂载期间跑, 也就是**只在 VR 操作模式下**才轮询。
-  late final GamepadPoller _gamepad = GamepadPoller(
-    onAxes: _c.onVrGamepadLook,
-  );
+  /// 只在本层挂载期间跑, 也就是**只在 VR 操作模式下**才采样。
+  late final GamepadPoller _gamepad = GamepadPoller(onSample: _onGamepadSample);
+
+  /// 最新一次摇杆采样(由帧 Ticker 消费)
+  double _axisX = 0;
+  double _axisY = 0;
+
+  /// 上一帧的时间戳, 用来算真实帧间隔
+  Duration _lastFrame = Duration.zero;
+
+  /// 逐帧积分摇杆(需求6): 采样(≈100Hz)与推进(每帧)解耦之后, 手柄环视的
+  /// 更新率与屏幕刷新率一致, 不再是"采样到一格走一格"。
+  // 不写显式类型: Ticker 由 scheduler 库提供, 靠推断省一个 import
+  late final _lookTicker = createTicker(_onFrame);
 
   PlPlayerController get _c => widget.controller;
 
@@ -65,6 +76,7 @@ class _VrControlLayerState extends State<VrControlLayer> {
       (_) => _c.pollVrHudAngles(),
     );
     _gamepad.start();
+    _lookTicker.start();
   }
 
   @override
@@ -72,7 +84,29 @@ class _VrControlLayerState extends State<VrControlLayer> {
     _hudTimer?.cancel();
     _hudTimer = null;
     _gamepad.stop();
+    _lookTicker.dispose();
     super.dispose();
+  }
+
+  void _onGamepadSample(double x, double y) {
+    _axisX = x;
+    _axisY = y;
+  }
+
+  void _onFrame(Duration elapsed) {
+    final previous = _lastFrame;
+    _lastFrame = elapsed;
+    if (_axisX == 0 && _axisY == 0) {
+      return; // 摇杆在死区里: 什么都不做(死区判定在 GamepadMath 里做过)
+    }
+    if (previous == Duration.zero) {
+      return; // 第一帧没有可靠的 dt
+    }
+    final dtSeconds = (elapsed - previous).inMicroseconds / Duration.microsecondsPerSecond;
+    if (dtSeconds <= 0) {
+      return;
+    }
+    _c.onVrGamepadLook(_axisX, _axisY, dtSeconds);
   }
 
   void _onScaleStart(ScaleStartDetails details) {

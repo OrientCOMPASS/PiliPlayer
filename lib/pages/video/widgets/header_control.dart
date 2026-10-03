@@ -1,4 +1,4 @@
-import 'dart:async' show Timer;
+import 'dart:async' show Timer, unawaited;
 import 'dart:convert' show jsonDecode, utf8;
 import 'dart:io' show Platform, File;
 import 'dart:typed_data' show Uint8List;
@@ -369,6 +369,47 @@ class HeaderControlState extends State<HeaderControl>
     } else {
       introController = Get.find<PgcIntroController>(tag: heroTag);
     }
+  }
+
+  /// 画中画(点按入口): 优先**系统** PiP(独立 Activity, 应用内可继续浏览);
+  /// 这条路走不通(设备不支持/系统拒绝/surface 没起来)时依次退回
+  /// ① 老的"整应用系统 PiP" ② 应用内浮窗 —— 保证按钮永远有反应。
+  Future<void> enterPip(BuildContext context) async {
+    final service = FloatingPlayerService.instance;
+    final args = videoDetailCtr.args;
+    final title = args['title']?.toString() ?? '正在播放';
+    // context 只在同步阶段用一次(await 之后不再碰, 免得页面已销毁)
+    final navigator = Navigator.maybeOf(context, rootNavigator: true);
+    final ok = await service.enterSystemPip(
+      navigator: navigator,
+      controller: plPlayerController,
+      title: title,
+      restoreArgs: args,
+    );
+    if (ok) {
+      return;
+    }
+    if (AndroidHelper.isPipAvailable) {
+      plPlayerController.enterPip();
+      return;
+    }
+    service.enter(
+      navigator: navigator,
+      controller: plPlayerController,
+      title: title,
+      restoreArgs: args,
+    );
+  }
+
+  /// 应用内浮窗(长按入口): 不出系统 PiP, 纯 Flutter 层的 root Overlay 小窗
+  void enterInAppPip(BuildContext context) {
+    final args = videoDetailCtr.args;
+    FloatingPlayerService.instance.enter(
+      navigator: Navigator.maybeOf(context, rootNavigator: true),
+      controller: plPlayerController,
+      title: args['title']?.toString() ?? '正在播放',
+      restoreArgs: args,
+    );
   }
 
   /// 设置面板
@@ -2306,28 +2347,14 @@ class HeaderControlState extends State<HeaderControl>
                   width: btnWidth,
                   height: btnHeight,
                   child: IconButton(
-                    // 第十九轮 需求3: 点按 = 应用内小窗(只收起播放页, 之后
-                    // 还能继续在应用里浏览); 长按 = 系统画中画(整个应用收起,
-                    // 适合离开应用时看)。
-                    tooltip: '画中画小窗(可继续浏览应用)\n长按: 系统画中画',
+                    // 第二十轮 需求2: 点按 = **系统**画中画。画面交给独立的
+                    // PipActivity(moonlight-android 的同款结构), 主 Activity
+                    // 留在原任务里, 所以 PiP 期间照样能逛应用; 播放器不重建,
+                    // 不重新拉流。长按 = 应用内浮窗(不依赖系统 PiP 的备选)。
+                    tooltip: '系统画中画(可继续浏览应用)\n长按: 应用内小窗',
                     style: btnStyle,
-                    onPressed: () {
-                      if (Platform.isAndroid) {
-                        FloatingPlayerService.instance.enter(
-                          context: context,
-                          controller: plPlayerController,
-                          title:
-                              videoDetailCtr.args['title']?.toString() ??
-                              '正在播放',
-                          restoreArgs: videoDetailCtr.args,
-                        );
-                      } else if (AndroidHelper.isPipAvailable) {
-                        plPlayerController.enterPip();
-                      }
-                    },
-                    onLongPress: AndroidHelper.isPipAvailable
-                        ? () => plPlayerController.enterPip()
-                        : null,
+                    onPressed: () => unawaited(enterPip(context)),
+                    onLongPress: () => enterInAppPip(context),
                     icon: const Icon(
                       Icons.picture_in_picture_outlined,
                       size: 19,

@@ -54,6 +54,7 @@ import 'package:archive/archive.dart' show getCrc32;
 import 'package:canvas_danmaku/canvas_danmaku.dart';
 import 'package:easy_debounce/easy_throttle.dart';
 import 'package:flutter/foundation.dart' show kDebugMode;
+import 'package:flutter/scheduler.dart' show SchedulerBinding;
 import 'package:flutter/services.dart' show HapticFeedback, DeviceOrientation;
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:flutter_volume_controller/flutter_volume_controller.dart';
@@ -515,6 +516,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   void _onUserLeaveHint() {
+    // 画面已经交给应用内小窗 / 独立 PiP Activity 时, 主 Activity 不要再
+    // 自己缩进系统 PiP(否则会出现两个小窗)
+    if (floatingKeepAlive) {
+      return;
+    }
     if (playerStatus.isPlaying && _isCurrVideoPage) {
       enterPip();
     }
@@ -876,6 +882,11 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 本次播放会话内 auto 是否已解析(避免 tracks 事件反复触发解析)
   bool _vrAutoResolved = false;
 
+  /// 本次会话内用户是否**手动**改过片源布局(播放页「VR/全景」菜单)。
+  /// 记忆播放设置时用它区分"用户就要平面播"与"这片源本来就不是全景"
+  /// —— 前者要记住(下次别再自动识别成 VR), 后者不该写进记忆。
+  bool vrUserTouched = false;
+
   /// VR 渲染视口的宽高比, 由 VrControlLayer 上报;
   /// 用于计算俯仰角的极点收敛边界(与 mpv 侧 vr_manual_angles 同一公式)
   double? _vrAspect;
@@ -946,12 +957,18 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
   }
 
-  /// 节流: setProperty 是直连 FFI 的同步调用, 单次开销可忽略, 但每次属性
-  /// 写入都会让 mpv 请求一次重绘, 拖拽期间合并到 ~30ms 一次,
-  /// 手势结束用 force 尾随补发, 保证最终视角与手指位置一致。
-  static const int vrApplyIntervalMs = 30;
-  int _vrLastApplyMs = 0;
-  Timer? _vrApplyTimer;
+  /// 下发节奏: **每帧最多一次**(第二十轮 需求6)。
+  ///
+  /// 旧实现按 30ms 节流(≈33Hz), 而陀螺仪头追是在补丁版 libmpv 里**逐帧**
+  /// 跑的(还带 33ms 前视补偿)。真机对比下来就是"摇杆/拖拽明显不如陀螺仪
+  /// 跟手": 60/90/120Hz 的屏幕上, 画面角度只有 33Hz 在动, 台阶感很强。
+  ///
+  /// 现在改用 SchedulerBinding 的帧回调合并: 一帧内来多少次输入都只写一次
+  /// 属性, 但**每一帧都会写** —— 更新率与屏幕刷新率一致。下发次数仍然可控:
+  /// yaw/pitch/fov 早已合并进单个 `vr-view` 属性(第十五轮的优化), 差分下发
+  /// 又保证值没变的属性不重复写, 所以每帧最多 1 次跨线程往返
+  /// (对比第十五轮出问题时的是 ~300 次/s)。
+  bool _vrFrameScheduled = false;
 
   void _initVrState(
     VrProjection? hint,
@@ -976,11 +993,12 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     }
     vrRequested.value = requested;
     _vrAutoResolved = false;
+    vrUserTouched = false;
     // auto 解析前按平面播放(解析结果出来才切 VR, 见 _maybeResolveVrAuto)
     vrProjection.value =
         requested == VrProjection.auto ? VrProjection.off : requested;
     vrView.value = VrViewState(fov: Pref.vrDefaultFov);
-    _vrLastApplyMs = 0;
+    _vrFrameScheduled = false;
     if (!vrEnabled) {
       vrControlMode.value = false;
       setVrGyro(false, persist: false, toast: false);
@@ -1150,6 +1168,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     VrProjection projection, {
     bool resetView = true,
   }) async {
+    vrUserTouched = true;
     vrRequested.value = projection;
     if (projection == VrProjection.auto) {
       // 立即按元数据解析(文件已加载); 引擎不支持时 _maybeResolveVrAuto
@@ -1263,12 +1282,52 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     vrStep(dyaw: delta.yaw, dpitch: delta.pitch);
   }
 
+  // ==================== 手柄按键长按连发(第二十轮 需求3) ====================
+
+  /// 长按连发的节奏: 与屏幕上 VR 步进按钮(`_VrStepButton`)完全一致 ——
+  /// 按下先走一步, 400ms 后开始每 110ms 一步, 松手停。
+  static const Duration keyRepeatDelay = Duration(milliseconds: 400);
+  static const Duration keyRepeatInterval = Duration(milliseconds: 110);
+
+  Timer? _keyRepeatDelay;
+  Timer? _keyRepeatTimer;
+
+  /// 开始连发: 立刻执行一次 [action], 按住不放则持续执行。
+  ///
+  /// 用**自己的定时器**而不是依赖系统按键重复(KeyRepeatEvent): 各机型/
+  /// 各手柄的重复速率差异很大, 而且 Flutter 只在部分平台把长按转成
+  /// KeyRepeatEvent, 自己计时才能保证"点一下走一步、按住连续走"。
+  void startKeyRepeat(VoidCallback action) {
+    stopKeyRepeat();
+    action();
+    _keyRepeatDelay = Timer(keyRepeatDelay, () {
+      _keyRepeatTimer = Timer.periodic(keyRepeatInterval, (_) => action());
+    });
+  }
+
+  void stopKeyRepeat() {
+    _keyRepeatDelay?.cancel();
+    _keyRepeatDelay = null;
+    _keyRepeatTimer?.cancel();
+    _keyRepeatTimer = null;
+  }
+
   /// 切换眼位(手柄方块键 / VR 按钮共用)。
   /// 单目片源明确提示, 不静默无反应(REQUIREMENTS.md 第 8 条)。
+  /// 眼位切换的冷却: 单次动作, 长按/按键抖动都不该连着切
+  static const Duration vrEyeToggleCooldown = Duration(milliseconds: 400);
+  DateTime? _lastVrEyeToggle;
+
   void toggleVrEye() {
     if (!vrEnabled) {
       return;
     }
+    final now = DateTime.now();
+    final last = _lastVrEyeToggle;
+    if (last != null && now.difference(last) < vrEyeToggleCooldown) {
+      return;
+    }
+    _lastVrEyeToggle = now;
     if (!vrProjection.value.isStereo) {
       SmartDialog.showToast('当前是单目片源，没有左右眼可切换');
       return;
@@ -1343,26 +1402,22 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     applyVrView(force: true);
   }
 
-  /// 把当前视角/布局应用到 mpv(节流 + 尾随下发)
+  /// 把当前视角/布局应用到 mpv(每帧合并一次; [force] 立即全量重发)
   void applyVrView({bool force = false}) {
-    final now = DateTime.now().millisecondsSinceEpoch;
-    final elapsed = now - _vrLastApplyMs;
-    if (!force && elapsed < vrApplyIntervalMs) {
-      _vrApplyTimer?.cancel();
-      _vrApplyTimer = Timer(
-        Duration(milliseconds: vrApplyIntervalMs - elapsed),
-        () {
-          _vrApplyTimer = null;
-          _vrLastApplyMs = DateTime.now().millisecondsSinceEpoch;
-          _applyVrProperties();
-        },
-      );
+    if (force) {
+      // 立即下发(进/出 VR 模式、切布局、摆正视角这些一次性动作),
+      // 帧回调那条路照常, 反正写的是同一份最新状态
+      _applyVrProperties(force: true);
       return;
     }
-    _vrApplyTimer?.cancel();
-    _vrApplyTimer = null;
-    _vrLastApplyMs = now;
-    _applyVrProperties(force: force);
+    if (_vrFrameScheduled) {
+      return; // 本帧已经排上了, 回调里取的是那一刻的最新角度
+    }
+    _vrFrameScheduled = true;
+    SchedulerBinding.instance.scheduleFrameCallback((_) {
+      _vrFrameScheduled = false;
+      _applyVrProperties();
+    });
   }
 
   /// 上次成功下发的 VR 属性值(差分下发用)。新建播放器实例时清空。
@@ -2310,6 +2365,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // 每次减1，最后销毁
     resetScreenRotation();
     cancelLongPressTimer();
+    stopKeyRepeat();
     _cancelSubForSeek();
     if (!_isCloseAll && _playerCount > 1) {
       _playerCount -= 1;
@@ -2352,8 +2408,7 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       vrError.value = null;
       vrGyroEnabled.value = false;
       vrMpvSupported.value = false;
-      _vrApplyTimer?.cancel();
-      _vrApplyTimer = null;
+      _vrFrameScheduled = false;
       isLocalMedia = false;
       _stopOrientationListener();
       _disableAutoEnterPip();

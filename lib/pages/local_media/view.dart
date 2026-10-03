@@ -106,31 +106,10 @@ class _LocalMediaPageState extends State<LocalMediaPage>
         for (final source in _controller.deviceSources) {
           children.add(_buildVolume(context, source));
         }
-        children.add(
-          Obx(
-            () => ListTile(
-              leading: const Icon(Icons.create_new_folder_outlined),
-              title: const Text('选择本机文件夹…'),
-              subtitle: Text(
-                _controller.safSources.isEmpty
-                    ? '系统授权后可看到该文件夹里的全部文件(推荐)'
-                    : '再授权一个文件夹(已授权 ${_controller.safSources.length} 个)',
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: _controller.pickingFolder.value
-                  ? const SizedBox(
-                      width: 18,
-                      height: 18,
-                      child: CircularProgressIndicator(strokeWidth: 2),
-                    )
-                  : const Icon(Icons.add),
-              onTap: _controller.pickingFolder.value
-                  ? null
-                  : () => _controller.pickSafFolder(),
-            ),
-          ),
-        );
+        // 第二十轮: 去掉常驻的「选择本机文件夹…」行 —— 真机确认"看不到文件"
+        // 就是权限问题, 开「所有文件访问权限」即可一次到位, 常驻一个授权入口
+        // 只是噪音。SAF 通道本身保留: ① 已授权过的目录树仍然列在最上面;
+        // ② 未开全文件权限又点存储卷时, 弹窗里仍有"选择本机文件夹"这一出路。
         if (!_controller.allFilesAccess.value) {
           children.add(
             ListTile(

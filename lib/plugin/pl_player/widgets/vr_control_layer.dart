@@ -2,6 +2,7 @@ import 'dart:async';
 
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/vr_projection.dart';
+import 'package:PiliPlus/plugin/pl_player/utils/gamepad.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 
@@ -45,6 +46,13 @@ class _VrControlLayerState extends State<VrControlLayer> {
   /// 给 core/VO 线程添堵)
   Timer? _hudTimer;
 
+  /// 手柄右摇杆轮询(需求5): 摇杆是 MotionEvent 模拟轴, 不会自动进 Dart,
+  /// 只能按固定节奏去 native 侧取最新读数(见 `utils/gamepad.dart`)。
+  /// 只在本层挂载期间跑, 也就是**只在 VR 操作模式下**才轮询。
+  late final GamepadPoller _gamepad = GamepadPoller(
+    onAxes: _c.onVrGamepadLook,
+  );
+
   PlPlayerController get _c => widget.controller;
 
   @override
@@ -56,12 +64,14 @@ class _VrControlLayerState extends State<VrControlLayer> {
       const Duration(milliseconds: 200),
       (_) => _c.pollVrHudAngles(),
     );
+    _gamepad.start();
   }
 
   @override
   void dispose() {
     _hudTimer?.cancel();
     _hudTimer = null;
+    _gamepad.stop();
     super.dispose();
   }
 

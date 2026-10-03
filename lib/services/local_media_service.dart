@@ -1,3 +1,4 @@
+import 'dart:async' show Completer;
 import 'dart:io';
 
 import 'package:PiliPlus/utils/path_utils.dart' show downloadPath;
@@ -7,6 +8,7 @@ import 'package:PiliPlus/http/loading_state.dart';
 import 'package:PiliPlus/models/local_media/local_media_item.dart';
 import 'package:PiliPlus/models/local_media/local_media_sort.dart';
 import 'package:PiliPlus/models/local_media/local_media_source.dart';
+import 'package:PiliPlus/services/saf/saf_bridge.dart';
 import 'package:PiliPlus/services/smb/smb2_client.dart' show NtStatus, SmbException;
 import 'package:PiliPlus/services/smb/smb_browse.dart';
 import 'package:PiliPlus/utils/permission_handler.dart';
@@ -20,15 +22,24 @@ import 'package:webdav_client/webdav_client.dart' as webdav;
 
 /// 「本地」板块的数据层: 本机目录浏览 + WebDAV 浏览 + 播放地址拼接。
 ///
-/// 设计上只依赖两样东西:
-///   * `dart:io` 直接读文件系统(安卓 13+ 由 READ_MEDIA_VIDEO 授权, 13 以下由
-///     READ_EXTERNAL_STORAGE 授权, 两者都已在 AndroidManifest 中声明);
-///   * 已有的 `webdav_client`(原本用于设置备份)浏览局域网 WebDAV。
-/// 播放交给 mpv: 安卓端打包的 FFmpeg 启用了 file/http/https/ftp 协议,
-/// 所以本机和 WebDAV/HTTP/FTP 都能直接播, 不需要在应用内做代理转发。
+/// 本机目录有**两条路**(第十九轮重写):
+///   * **SAF(默认)** —— 用户经系统「选择文件夹」授权一个目录树, 之后走
+///     DocumentsContract 列举, 能看到树下的**全部**条目(与系统文件管理器
+///     一致), 授权持久化。`type` 仍是 [LocalMediaSourceType.device], 只是
+///     `url` 为 `content://…/tree/…`; 播放时经 ContentResolver 导出 fd,
+///     以 `fd://N` 交给定制 libmpv。见 `services/saf/saf_bridge.dart`。
+///   * **直读(dart:io)** —— 安卓 10 及以下、或已授予「所有文件访问权限」时
+///     完整可用; 否则作用域存储只让应用看到媒体文件(用户会以为"目录显示
+///     不全 / 文件管理器里有应用里没有"), 因此界面上把它标成受限模式。
+/// 局域网仍由 `webdav_client` 与自研 SMB 客户端负责。
+/// 播放交给 mpv: 安卓端打包的 FFmpeg 启用了 file/http/https/ftp/fd 协议,
+/// 所以本机、SAF 与 WebDAV/HTTP/FTP 都能直接播, 不需要在应用内做代理转发。
 abstract final class LocalMediaService {
   /// 安卓主存储的根目录
   static const String primaryStorage = '/storage/emulated/0';
+
+  /// 是不是 SAF(系统文件夹授权)来源: device 类型 + content:// 树地址
+  static bool isSafSource(LocalMediaSource source) => source.isSafTree;
 
   // ==================== 来源管理 ====================
 
@@ -94,6 +105,51 @@ abstract final class LocalMediaService {
     }
     return p.join(p.separator, parts[1], parts[2]);
   }
+
+  /// 已由系统授权的 SAF 目录树(「本机存储」的主力入口)。
+  ///
+  /// 授权是**系统**记着的(持久化 URI 权限), 不写进本应用的来源列表,
+  /// 因此这里每次都现查; 撤销授权后自然从列表里消失。
+  static Future<List<LocalMediaSource>> safSources() async {
+    final trees = await SafBridge.persistedTrees();
+    return [
+      for (final tree in trees)
+        LocalMediaSource(
+          type: LocalMediaSourceType.device,
+          name: tree.name,
+          url: tree.uri,
+        ),
+    ];
+  }
+
+  /// 弹系统「选择文件夹」授权一个目录树; 用户取消返回 null。
+  ///
+  /// [volumeId] 为 null/'primary' 时选择器从内部存储根开始。
+  static Future<LocalMediaSource?> pickSafSource({String? volumeId}) async {
+    final tree = await SafBridge.pickTree(
+      initialUri: SafBridge.initialUriForVolume(volumeId),
+    );
+    if (tree == null) {
+      return null;
+    }
+    return LocalMediaSource(
+      type: LocalMediaSourceType.device,
+      name: tree.name,
+      url: tree.uri,
+    );
+  }
+
+  /// 撤销一个 SAF 目录树的授权(从「本机存储」里移除入口)
+  static Future<bool> releaseSafSource(LocalMediaSource source) =>
+      SafBridge.releaseTree(source.url);
+
+  /// 「所有文件访问权限」(MANAGE_EXTERNAL_STORAGE)是否已开:
+  /// 开了之后直读模式与系统文件管理器一致, 不需要逐个文件夹授权。
+  static Future<bool> hasAllFilesAccess() => SafBridge.hasAllFilesAccess();
+
+  /// 打开系统的「所有文件访问权限」设置页
+  static Future<bool> openAllFilesAccessSettings() =>
+      SafBridge.openAllFilesAccessSettings();
 
   // ==================== 权限 ====================
 
@@ -212,6 +268,11 @@ abstract final class LocalMediaService {
   static String? parentDirOf(LocalMediaItem item) {
     switch (item.source.type) {
       case LocalMediaSourceType.device:
+        // SAF 条目: uri 是 content:// 文档地址, "所在目录"要用文档 id 推
+        if (SafBridge.isContentUri(item.uri)) {
+          final docId = item.remotePath;
+          return docId == null ? null : SafBridge.parentDocId(docId);
+        }
         final dir = p.dirname(item.uri);
         return dir.isEmpty ? null : dir;
       case LocalMediaSourceType.smb:
@@ -294,10 +355,11 @@ abstract final class LocalMediaService {
   static String childPath(
     LocalMediaSource source,
     LocalMediaItem item,
-  ) => switch (source.type) {
-    LocalMediaSourceType.device => item.uri,
-    _ => item.remotePath ?? item.uri,
-  };
+  ) =>
+      // 本机直读: remotePath 为空, 下一层就是条目的绝对路径;
+      // SAF 目录树: 条目的 uri 是 content:// 文档地址, 能用来继续下钻的是
+      // 文档 id(放在 remotePath 里); 网络来源同理用服务器相对路径。
+      item.remotePath ?? item.uri;
 
   /// 在 [rootPath] **及其所有子目录**里检索文件名包含 [query] 的条目
   /// (与列表一致: 不按扩展名过滤, 能不能播交给播放器判断)。
@@ -380,26 +442,52 @@ abstract final class LocalMediaService {
     String path, {
     required bool showHidden,
   }) async {
+    if (isSafSource(source)) {
+      return _listSaf(source, path, showHidden: showHidden);
+    }
     final dir = Directory(path);
     if (!dir.existsSync()) {
-      throw '目录不存在: $path';
+      throw '目录不存在或无权访问: $path';
     }
+    // 逐条目容错: 以前用 `await for`, 目录里**任何一个**条目读不出来(作用域
+    // 存储下的 Android/data、失效软链、EACCES 的子项)都会让整层结果作废,
+    // 这正是"目录显示不全"的一大来源。现在 listen + onError: 出错跳过,
+    // 已拿到的照常返回; 只有一条都没拿到时才当整层失败抛出去。
+    final entities = <FileSystemEntity>[];
+    Object? streamError;
+    final done = Completer<void>();
+    dir
+        .list(followLinks: false)
+        .listen(
+          entities.add,
+          onError: (Object err) {
+            streamError ??= err;
+          },
+          onDone: done.complete,
+          cancelOnError: false,
+        );
+    await done.future;
+
     final items = <LocalMediaItem>[];
-    await for (final entity in dir.list(followLinks: false)) {
+    for (final entity in entities) {
       final name = p.basename(entity.path);
-      if (name.isEmpty) {
+      if (name.isEmpty || name == '.' || name == '..') {
         continue;
       }
       if (!showHidden && name.startsWith('.')) {
         continue;
       }
-      final isDir = entity is Directory;
-      if (!isDir && entity is! File) {
-        continue;
-      }
-      // 单个条目读不到属性就跳过, 不影响整个目录
+      // 单个条目读不到属性就跳过, 不影响整个目录。
+      // stat() 跟随软链: 以前 `entity is! File && entity is! Directory` 会把
+      // 软链条目整条丢掉(安卓上相当多目录/文件是软链), 现在按**目标**类型
+      // 归类, 只有指向空的死链才跳过。
       final stat = await _statOrNull(entity);
       if (stat == null) {
+        continue;
+      }
+      final type = stat.type;
+      final isDir = type == FileSystemEntityType.directory;
+      if (!isDir && type != FileSystemEntityType.file) {
         continue;
       }
       items.add(
@@ -413,7 +501,43 @@ abstract final class LocalMediaService {
         ),
       );
     }
+    final err = streamError;
+    if (items.isEmpty && err != null) {
+      throw err;
+    }
     return items;
+  }
+
+  /// SAF(系统「选择文件夹」授权)目录树: 走 DocumentsContract。
+  ///
+  /// 这是本机浏览的**默认**路径 —— 作用域存储下 `dart:io` 只能看到媒体文件,
+  /// 用户会遇到"文件管理器里有、应用里找不到 / 目录显示不全"; 授权之后
+  /// 系统按目录树放行, 列表与系统文件管理器一致。
+  static Future<List<LocalMediaItem>> _listSaf(
+    LocalMediaSource source,
+    String path, {
+    required bool showHidden,
+  }) async {
+    final entries = await SafBridge.listChildren(
+      treeUri: source.url,
+      docId: path.isEmpty ? null : path,
+    );
+    return [
+      for (final entry in entries)
+        if (showHidden || !entry.name.startsWith('.'))
+          LocalMediaItem(
+            name: entry.name,
+            // content:// 文档地址: 既是稳定标识(续播记忆、播放列表归组、
+            // 字幕同名匹配都按它), 也是播放时导出 fd 的入口
+            uri: entry.uri,
+            source: source,
+            // SAF 的"下一层路径"是文档 id, 借用 remotePath 字段承载
+            remotePath: entry.docId,
+            size: entry.size,
+            modified: entry.modified,
+            isDirectory: entry.isDirectory,
+          ),
+    ];
   }
 
   /// 目录里条目可能很多, 用异步 stat 避免阻塞 UI 线程
@@ -601,6 +725,16 @@ abstract final class LocalMediaService {
   /// 回环 HTTP 代理路径(兜底)。其余协议(WebDAV/HTTP/FTP/本机)原样返回。
   static Future<String> resolvePlayUrl(LocalMediaItem item) async {
     final source = item.source;
+    // SAF 授权的条目: content:// 不能被 mpv 直接读, 经 ContentResolver 导出
+    // fd 后以 `fd://N` 播放(与系统「用其它应用打开」进来的视频同一条路)。
+    // 外挂字幕也走这里(同名匹配到的 .srt/.ass 同样是 SAF 文档)。
+    if (SafBridge.isContentUri(item.uri)) {
+      final url = await SafBridge.playUrlOf(item.uri);
+      if (url == null) {
+        throw const SafFailure('无法打开该文件, 目录授权可能已失效, 请重新选择文件夹');
+      }
+      return url;
+    }
     if (!source.type.needsProxy) {
       return playbackUrl(item);
     }
@@ -746,6 +880,15 @@ abstract final class LocalMediaService {
   static Future<LoadingState<int>> testConnection(
     LocalMediaSource source,
   ) async {
+    // SAF 目录树: 列一次根目录就是最真实的连通性检查
+    if (isSafSource(source)) {
+      try {
+        final items = await listOrThrow(source: source, path: '');
+        return Success(items.length);
+      } catch (err) {
+        return Error(_humanize(err, source));
+      }
+    }
     switch (source.type) {
       case LocalMediaSourceType.webdav:
         return testWebDav(source);
@@ -917,9 +1060,32 @@ abstract final class LocalMediaService {
     return Uri.encodeComponent(decoded);
   }
 
+  /// SAF 来源的可读标签: `内部存储/Download/电影`。
+  /// 收藏的子目录([LocalMediaSource.subPath])优先, 否则显示树根。
+  static String safLabel(LocalMediaSource source) {
+    final docId = source.subPath ?? SafBridge.treeDocIdOf(source.url);
+    return docId == null || docId.isEmpty
+        ? source.name
+        : SafBridge.readablePath(docId);
+  }
+
+  /// 给人看的路径(详情/复制/播放列表副标题用)。
+  ///
+  /// SAF 条目的 uri 是 `content://com.android.externalstorage.documents/…`
+  /// 这种长串, 直接摊给用户没有意义 —— 换成文档 id 推出来的可读路径
+  /// (`内部存储/Download/电影/a.mkv`); 网络来源仍然脱敏显示完整地址。
+  static String displayPath(LocalMediaItem item) {
+    if (SafBridge.isContentUri(item.uri)) {
+      final docId = item.remotePath;
+      if (docId != null && docId.isNotEmpty) {
+        return SafBridge.readablePath(docId);
+      }
+    }
+    return maskedUrl(item.uri);
+  }
+
   /// 播放地址去掉凭据后的形式, 用于界面展示与复制(避免密码外泄)
-  static String maskedUrl(String url) {
-    final uri = Uri.tryParse(url);
+  static String maskedUrl(String url) {    final uri = Uri.tryParse(url);
     if (uri == null || uri.userInfo.isEmpty) {
       return url;
     }
@@ -937,6 +1103,10 @@ abstract final class LocalMediaService {
   }
 
   static String _humanize(Object err, LocalMediaSource source) {
+    // SAF 的失败原因本身就是写给人看的(授权失效/无读取权限), 只补个来源名
+    if (err is SafFailure) {
+      return '${source.name}: ${err.message}';
+    }
     // SMB 的协议错误单独翻译(状态码对用户没有意义)
     if (err is SmbException) {
       return _translateSmb(err, source);

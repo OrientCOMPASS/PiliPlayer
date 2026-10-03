@@ -18,8 +18,16 @@ import 'package:material_ui/material_ui.dart';
 /// 「本地」板块控制器(第十八轮改版): 不再做全盘扫描的"媒体库",
 /// 只负责 本机存储卷入口 + 用户收藏的快捷方式 + 局域网主机发现/来源管理。
 class LocalMediaController extends GetxController {
-  /// 本机存储卷(主存储 + SD 卡/U 盘)
+  /// 本机存储卷(主存储 + SD 卡/U 盘) —— **直读**模式(dart:io)。
+  /// 安卓 11+ 未开「所有文件访问权限」时, 直读只能看到媒体文件。
   final RxList<LocalMediaSource> deviceSources = <LocalMediaSource>[].obs;
+
+  /// 已由系统授权的 SAF 目录树(「选择本机文件夹」的结果)。
+  /// 这是本机浏览的**主力入口**: 能看到目录里的全部文件, 授权重启不丢。
+  final RxList<LocalMediaSource> safSources = <LocalMediaSource>[].obs;
+
+  /// 系统「所有文件访问权限」(MANAGE_EXTERNAL_STORAGE)是否已开
+  final RxBool allFilesAccess = false.obs;
 
   /// 用户添加的网络共享(SMB / WebDAV / HTTP / FTP)
   final RxList<LocalMediaSource> savedSources = <LocalMediaSource>[].obs;
@@ -54,6 +62,60 @@ class LocalMediaController extends GetxController {
 
   Future<void> refreshDevices() async {
     deviceSources.value = await LocalMediaService.deviceSources();
+    await refreshSafSources();
+  }
+
+  /// 刷新已授权的 SAF 目录树与「所有文件访问权限」状态。
+  /// 从系统设置页回来、从文件夹选择器回来、板块重新可见时都要刷。
+  Future<void> refreshSafSources() async {
+    try {
+      safSources.value = await LocalMediaService.safSources();
+    } on Object {
+      // SAF 不可用(被厂商裁剪等)不影响直读入口, 静默保持旧列表
+    }
+    allFilesAccess.value = await LocalMediaService.hasAllFilesAccess();
+  }
+
+  /// 弹系统「选择文件夹」授权一个目录树, 成功后直接进入浏览。
+  ///
+  /// [volumeId] 用来让选择器落在指定存储卷上(null = 内部存储)。
+  Future<void> pickSafFolder({String? volumeId}) async {
+    if (pickingFolder.value) {
+      return;
+    }
+    pickingFolder.value = true;
+    try {
+      final source = await LocalMediaService.pickSafSource(volumeId: volumeId);
+      if (source == null) {
+        return; // 用户取消
+      }
+      await refreshSafSources();
+      _browse(source, source.rootPath, source.name);
+    } on Object catch (err) {
+      SmartDialog.showToast('授权失败: $err');
+    } finally {
+      pickingFolder.value = false;
+    }
+  }
+
+  /// 正在弹系统文件夹选择器(防重复点击)
+  final RxBool pickingFolder = false.obs;
+
+  /// 撤销一个目录树的系统授权
+  Future<void> removeSafSource(LocalMediaSource source) async {
+    await LocalMediaService.releaseSafSource(source);
+    savedSources.removeWhere(
+      (e) => e.isSafTree && e.url == source.url,
+    );
+    await _persist();
+    await refreshSafSources();
+  }
+
+  /// 打开系统「所有文件访问权限」设置页
+  Future<void> openAllFilesSettings() async {
+    if (!await LocalMediaService.openAllFilesAccessSettings()) {
+      SmartDialog.showToast('这台设备打不开该设置页, 请改用「选择本机文件夹」');
+    }
   }
 
   /// 刷新"部分访问"权限提示(只探测状态, 不弹授权框)
@@ -63,7 +125,8 @@ class LocalMediaController extends GetxController {
         : null;
   }
 
-  /// 板块重新可见(应用回前台)时调用: 刷新存储卷与权限提示
+  /// 板块重新可见(应用回前台)时调用: 刷新存储卷、SAF 授权与权限提示
+  /// (用户可能刚在系统设置里开了「所有文件访问权限」, 或刚授权了新文件夹)
   void onResumed() {
     refreshDevices();
     refreshAccessNotice();
@@ -154,13 +217,104 @@ class LocalMediaController extends GetxController {
 
   // ==================== 打开 ====================
 
-  /// 本机存储卷 -> 浏览页
-  Future<void> openDevice(LocalMediaSource source) async {
+  /// 本机入口 -> 浏览页。
+  ///
+  /// * SAF 目录树: 直接进(系统授权就是通行证, 不需要任何媒体权限);
+  /// * 存储卷(直读): 已开「所有文件访问权限」时直接进, 否则先把
+  ///   "直读只能看到媒体文件"这件事摊开, 让用户选授权方式 —— 真机反馈的
+  ///   "文件管理器里有、应用里找不到"就是这么来的, 不能默默把人放进去。
+  Future<void> openDevice(BuildContext context, LocalMediaSource source) async {
+    if (source.isSafTree || allFilesAccess.value) {
+      _browse(source, source.rootPath, source.name);
+      return;
+    }
     if (!await LocalMediaService.ensureDevicePermission()) {
       SmartDialog.showToast('未获得存储读取权限，无法浏览本机文件');
       return;
     }
-    _browse(source, source.rootPath, source.name);
+    if (!context.mounted) {
+      return;
+    }
+    await _askDeviceAccessMode(context, source);
+  }
+
+  /// 直读受限时的选择框
+  Future<void> _askDeviceAccessMode(
+    BuildContext context,
+    LocalMediaSource volume,
+  ) async {
+    final choice = await showDialog<DeviceAccessChoice>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text('浏览「${volume.name}」'),
+        contentPadding: const EdgeInsets.symmetric(vertical: 8),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          crossAxisAlignment: CrossAxisAlignment.start,
+          children: [
+            const Padding(
+              padding: EdgeInsets.fromLTRB(16, 4, 16, 8),
+              child: Text(
+                '安卓 11 以后, 应用直接读存储只能看到图片/视频这类媒体文件, '
+                '其它文件和部分文件夹会「看不见」。选一种方式继续:',
+                style: TextStyle(fontSize: 13),
+              ),
+            ),
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.drive_file_move_outline),
+              title: const Text('选择本机文件夹(推荐)'),
+              subtitle: const Text(
+                '系统授权, 能看到该文件夹里的全部文件, 授权长期有效',
+                style: TextStyle(fontSize: 12),
+              ),
+              onTap: () => Navigator.of(dialogContext).pop(
+                DeviceAccessChoice.pickFolder,
+              ),
+            ),
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.folder_open_outlined),
+              title: const Text('开启「所有文件访问权限」'),
+              subtitle: const Text(
+                '去系统设置放开整个存储, 之后直读也能看全',
+                style: TextStyle(fontSize: 12),
+              ),
+              onTap: () => Navigator.of(dialogContext).pop(
+                DeviceAccessChoice.allFiles,
+              ),
+            ),
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.visibility_off_outlined),
+              title: const Text('仍然直接浏览(可能不全)'),
+              onTap: () => Navigator.of(dialogContext).pop(
+                DeviceAccessChoice.direct,
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+    switch (choice) {
+      case DeviceAccessChoice.pickFolder:
+        await pickSafFolder(volumeId: volumeIdOf(volume.url));
+      case DeviceAccessChoice.allFiles:
+        await openAllFilesSettings();
+      case DeviceAccessChoice.direct:
+        _browse(volume, volume.rootPath, volume.name);
+      case null:
+        break;
+    }
+  }
+
+  /// 存储卷路径 -> SAF 的卷 id(`/storage/emulated/0` -> `primary`)
+  static String? volumeIdOf(String path) {
+    final parts = path.split('/').where((e) => e.isNotEmpty).toList();
+    if (parts.length < 2 || parts[0] != 'storage') {
+      return null;
+    }
+    return parts[1] == 'emulated' ? 'primary' : parts[1];
   }
 
   /// 已保存的网络来源
@@ -323,13 +477,7 @@ class LocalMediaController extends GetxController {
   }) {
     final name = title.isEmpty ? source.name : title;
     return switch (source.type) {
-      LocalMediaSourceType.device => path.isEmpty
-          ? null
-          : LocalMediaSource(
-              type: LocalMediaSourceType.device,
-              name: name,
-              url: path,
-            ),
+      LocalMediaSourceType.device => _deviceShortcut(source, path, name),
       LocalMediaSourceType.smb => _smbShortcut(source, path, name),
       LocalMediaSourceType.webdav => path.isEmpty || path == '/'
           ? null
@@ -343,6 +491,37 @@ class LocalMediaController extends GetxController {
       // 直链来源没有目录可收藏
       LocalMediaSourceType.http || LocalMediaSourceType.ftp => null,
     };
+  }
+
+  /// 本机目录的收藏:
+  /// * 直读路径 —— url 就是绝对路径;
+  /// * SAF 目录树 —— 授权始终是整棵树, 收藏只是多记一个"打开后落到哪一层"
+  ///   的文档 id([LocalMediaSource.subPath]), 否则撤销授权前无法定位子目录。
+  static LocalMediaSource? _deviceShortcut(
+    LocalMediaSource source,
+    String path,
+    String name,
+  ) {
+    if (path.isEmpty) {
+      return null;
+    }
+    if (source.isSafTree) {
+      // 就在树根上: 收藏它等于收藏系统授权本身(列表里已经有了)
+      if (path == (source.subPath ?? '')) {
+        return null;
+      }
+      return LocalMediaSource(
+        type: LocalMediaSourceType.device,
+        name: name,
+        url: source.url,
+        subPath: path,
+      );
+    }
+    return LocalMediaSource(
+      type: LocalMediaSourceType.device,
+      name: name,
+      url: path,
+    );
   }
 
   static LocalMediaSource? _smbShortcut(
@@ -547,3 +726,6 @@ class LocalMediaController extends GetxController {
   }
 
 }
+
+/// 直读受限时, 用户选择的进入方式
+enum DeviceAccessChoice { pickFolder, allFiles, direct }

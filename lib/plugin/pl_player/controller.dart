@@ -30,6 +30,7 @@ import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
 import 'package:PiliPlus/plugin/pl_player/models/video_fit_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/vr_projection.dart';
+import 'package:PiliPlus/plugin/pl_player/utils/gamepad.dart';
 import 'package:PiliPlus/plugin/pl_player/utils/fullscreen.dart';
 import 'package:PiliPlus/services/service_locator.dart';
 import 'package:PiliPlus/utils/accounts.dart';
@@ -203,6 +204,13 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 该标志恒为 false, 仅为让播放器 UI 中大量 `isFullScreen || isDesktopPip`
   /// 之类的判断无需逐处改写(在安卓上始终走非 PiP 分支)。
   bool get isDesktopPip => false;
+
+  /// **应用内画中画(小窗)保活**标记 —— 见 `services/floating_player.dart`。
+  ///
+  /// 为 true 时播放页出栈**不销毁**播放器: 小窗还在用它渲染(root Overlay
+  /// 上的浮窗持有同一个 [VideoController]/mpv 实例), 最终的 dispose 由浮窗
+  /// 服务负责(关闭小窗)或交还给新的播放页(点小窗回播放页)。
+  bool floatingKeepAlive = false;
 
   late bool _isAutoEnterPip = false;
   bool get isAutoEnterPip => _isAutoEnterPip;
@@ -1115,8 +1123,10 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
       // 头追跟随设置项自动启停(退出控制模式即停, 不与常规手势抢方向)
       setVrGyro(Pref.vrGyro, persist: false, toast: false);
       SmartDialog.showToast(
-        'VR 操作模式：单指拖拽环视，双指缩放视场角\n点按顶部提示条可退回常规操作',
-        displayTime: const Duration(milliseconds: 3000),
+        'VR 操作模式：单指拖拽环视，双指缩放视场角\n'
+        '手柄：右摇杆环视，△ 摆正视角，□ 切换眼位\n'
+        '点按顶部提示条可退回常规操作',
+        displayTime: const Duration(milliseconds: 3500),
       );
     } else {
       setVrGyro(false, persist: false, toast: false);
@@ -1219,6 +1229,42 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           gyro: vrGyroEnabled.value,
         );
     applyVrView();
+  }
+
+  // ==================== VR 手柄控制(第十九轮 需求5) ====================
+
+  /// 手柄右摇杆环视。[axisX]/[axisY] 为安卓轴值(右/下为 +1),
+  /// [dtSeconds] 是距上次采样的间隔(轮询节奏会抖动, 用它积分才匀速)。
+  ///
+  /// 死区/角速度/方向约定都在 `GamepadMath`(纯函数, 有单测):
+  /// 摇杆推右 = 视线向右(yaw 增大), 摇杆推上 = 视线向上(pitch 减小,
+  /// 与 [onVrLook] 的"拖动世界"语义一致)。
+  ///
+  /// **不会**点亮播放器控件层: 手柄环视时弹出 UI 只会挡住 VR 按钮和画面。
+  void onVrGamepadLook(double axisX, double axisY, double dtSeconds) {
+    if (!vrEnabled) {
+      return;
+    }
+    final delta = GamepadMath.look(axisX, axisY, dtSeconds);
+    if (delta.yaw == 0 && delta.pitch == 0) {
+      return;
+    }
+    vrStep(dyaw: delta.yaw, dpitch: delta.pitch);
+  }
+
+  /// 切换眼位(手柄方块键 / VR 按钮共用)。
+  /// 单目片源明确提示, 不静默无反应(REQUIREMENTS.md 第 8 条)。
+  void toggleVrEye() {
+    if (!vrEnabled) {
+      return;
+    }
+    if (!vrProjection.value.isStereo) {
+      SmartDialog.showToast('当前是单目片源，没有左右眼可切换');
+      return;
+    }
+    final next = vrEye.value == VrEye.left ? VrEye.right : VrEye.left;
+    unawaited(setVrEye(next));
+    SmartDialog.showToast('已切换到${next.label}');
   }
 
   /// 设置水平视场角(双指缩放的绝对映射)

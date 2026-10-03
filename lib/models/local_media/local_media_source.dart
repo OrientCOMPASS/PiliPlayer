@@ -44,6 +44,7 @@ class LocalMediaSource {
     this.password,
     this.domain,
     this.address,
+    this.subPath,
     this.favorite = false,
   });
 
@@ -60,6 +61,12 @@ class LocalMediaSource {
   /// (NBNS 广播在个别网络里会被拦, 有它在就永远连得上)
   final String? address;
 
+  /// SAF 目录树的浏览起点(文档 id, 例如 `primary:Download/电影`)。
+  ///
+  /// 只有 [isSafTree] 用得到: 收藏一个子目录时, 系统授权仍然是整棵树,
+  /// 这里记下"打开后直接落到哪一层"。为空表示从树根开始。
+  final String? subPath;
+
   /// 是否为用户**主动收藏**的快捷方式(第十八轮): 只有收藏的才在「本地」
   /// 板块展示; 连接过的主机会以 favorite=false 存凭据, 不再刷屏列表。
   /// 刻意**不参与** [operator==] —— 同一来源的收藏态变更走替换更新。
@@ -69,6 +76,16 @@ class LocalMediaSource {
       (username?.isNotEmpty ?? false) || (password?.isNotEmpty ?? false);
 
   bool get canBrowse => type.browsable;
+
+  /// 本机 **SAF** 来源(第十九轮): `type` 仍是 [LocalMediaSourceType.device],
+  /// 但 [url] 是系统「选择文件夹」授权出来的目录树地址
+  /// (`content://com.android.externalstorage.documents/tree/primary%3ADownload`)。
+  ///
+  /// 之所以不新增枚举值: 播放列表归组、续播记忆、字幕同名匹配、来源持久化
+  /// 全都按 `device` 分支走, 复用它可以一行不改; 差异只在服务层的"怎么列
+  /// 目录 / 怎么拿播放地址"两处(见 LocalMediaService)。
+  bool get isSafTree =>
+      type == LocalMediaSourceType.device && url.startsWith('content://');
 
   /// 解析 `smb://host[:port]/share[/子目录]`。
   /// URL 里没写共享名(主机级来源, 见 [isSmbHostRoot])时返回 null。
@@ -163,7 +180,9 @@ class LocalMediaSource {
   /// SMB 主机级来源: 空串, 由服务层解释为"列共享"。
   String get rootPath {
     if (type == LocalMediaSourceType.device) {
-      return url;
+      // SAF 目录树的浏览起点是文档 id(收藏的子目录 -> subPath, 否则树根);
+      // 直读模式才是绝对路径
+      return isSafTree ? (subPath ?? '') : url;
     }
     if (type == LocalMediaSourceType.smb) {
       return smbEndpoint?.path ?? '';
@@ -213,6 +232,7 @@ class LocalMediaSource {
     if (password != null) 'password': password,
     if (domain != null) 'domain': domain,
     if (address != null) 'address': address,
+    if (subPath != null) 'subPath': subPath,
     if (favorite) 'favorite': true,
   };
 
@@ -236,6 +256,7 @@ class LocalMediaSource {
       password: json['password'] as String?,
       domain: json['domain'] as String?,
       address: json['address'] as String?,
+      subPath: json['subPath'] as String?,
       favorite: json['favorite'] == true,
     );
   }
@@ -254,6 +275,7 @@ class LocalMediaSource {
     password: password,
     domain: domain,
     address: address,
+    subPath: subPath,
     favorite: favorite,
   );
 
@@ -265,6 +287,7 @@ class LocalMediaSource {
     String? password,
     String? domain,
     String? address,
+    String? subPath,
     bool? favorite,
   }) => LocalMediaSource(
     type: type ?? this.type,
@@ -274,6 +297,7 @@ class LocalMediaSource {
     password: password ?? this.password,
     domain: domain ?? this.domain,
     address: address ?? this.address,
+    subPath: subPath ?? this.subPath,
     favorite: favorite ?? this.favorite,
   );
 
@@ -285,7 +309,8 @@ class LocalMediaSource {
       other.url == url &&
       other.username == username &&
       other.password == password &&
-      other.domain == domain;
+      other.domain == domain &&
+      other.subPath == subPath;
 
   @override
   int get hashCode => Object.hash(
@@ -295,6 +320,7 @@ class LocalMediaSource {
     username,
     password,
     domain,
+    subPath,
   );
 
   @override

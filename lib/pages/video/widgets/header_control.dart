@@ -36,6 +36,7 @@ import 'package:PiliPlus/pages/video/introduction/ugc/widgets/action_item.dart';
 import 'package:PiliPlus/pages/video/introduction/ugc/widgets/menu_row.dart';
 import 'package:PiliPlus/pages/video/widgets/header_mixin.dart';
 import 'package:PiliPlus/pages/video/introduction/local_media/controller.dart';
+import 'package:PiliPlus/services/floating_player.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
@@ -2305,13 +2306,28 @@ class HeaderControlState extends State<HeaderControl>
                   width: btnWidth,
                   height: btnHeight,
                   child: IconButton(
-                    tooltip: '画中画',
+                    // 第十九轮 需求3: 点按 = 应用内小窗(只收起播放页, 之后
+                    // 还能继续在应用里浏览); 长按 = 系统画中画(整个应用收起,
+                    // 适合离开应用时看)。
+                    tooltip: '画中画小窗(可继续浏览应用)\n长按: 系统画中画',
                     style: btnStyle,
                     onPressed: () {
-                      if (AndroidHelper.isPipAvailable) {
+                      if (Platform.isAndroid) {
+                        FloatingPlayerService.instance.enter(
+                          context: context,
+                          controller: plPlayerController,
+                          title:
+                              videoDetailCtr.args['title']?.toString() ??
+                              '正在播放',
+                          restoreArgs: videoDetailCtr.args,
+                        );
+                      } else if (AndroidHelper.isPipAvailable) {
                         plPlayerController.enterPip();
                       }
                     },
+                    onLongPress: AndroidHelper.isPipAvailable
+                        ? () => plPlayerController.enterPip()
+                        : null,
                     icon: const Icon(
                       Icons.picture_in_picture_outlined,
                       size: 19,

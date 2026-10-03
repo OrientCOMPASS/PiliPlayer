@@ -18,6 +18,7 @@ import 'package:PiliPlus/pages/common/publish/publish_route.dart';
 import 'package:PiliPlus/pages/contact/view.dart';
 import 'package:PiliPlus/pages/fav_panel/view.dart';
 import 'package:PiliPlus/pages/share/view.dart';
+import 'package:PiliPlus/services/floating_player.dart';
 import 'package:PiliPlus/utils/android/android_helper.dart';
 import 'package:PiliPlus/utils/app_scheme.dart';
 import 'package:PiliPlus/utils/extension/context_ext.dart';
@@ -511,6 +512,8 @@ abstract final class PageUtils {
     if (roomId == null) {
       return;
     }
+    // 直播间同样复用单例播放器
+    FloatingPlayerService.instance.closeIfActive();
     Get.offOrToNamed(
       '/liveRoom',
       arguments: roomId,
@@ -550,6 +553,8 @@ abstract final class PageUtils {
       'heroTag': Utils.makeHeroTag(cid),
       ...?extraArguments,
     };
+    // 播放器是单例: 应用内小窗还挂着时先收掉, 否则两个页面会抢同一个实例
+    FloatingPlayerService.instance.closeIfActive();
     return PageUtils.toDupNamed('/videoV', arguments: arguments, off: off);
   }
 

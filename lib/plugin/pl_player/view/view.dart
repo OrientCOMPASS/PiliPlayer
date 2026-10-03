@@ -2030,6 +2030,13 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
             ),
 
           // 截图
+          //
+          // VR 操作模式下**整块隐藏**(真机反馈: 它与 VrControlLayer 右侧的
+          // 视场角/摆正/陀螺仪/眼位按钮叠在一起, 拖拽环视时经常误触截图)。
+          // 控件层在 Stack 里位于 VrControlLayer 之上, 靠"挪位置"并不能真正
+          // 让开(竖屏时右侧就那么宽), 所以直接不让它出现: VR 模式下截图仍然
+          // 可用——退出 VR 操作模式(顶部读数条点按)即可, 外接键盘的截图快捷键
+          // 也不受影响。
           if (plPlayerController.showFsScreenshotBtn)
             ViewSafeArea(
               left: false,
@@ -2040,7 +2047,9 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
                   child: FractionalTranslation(
                     translation: const Offset(-1, -0.4),
                     child: Offstage(
-                      offstage: !plPlayerController.showControls.value,
+                      offstage:
+                          !plPlayerController.showControls.value ||
+                          plPlayerController.vrControlMode.value,
                       child: DecoratedBox(
                         decoration: const BoxDecoration(
                           color: Color(0x45000000),

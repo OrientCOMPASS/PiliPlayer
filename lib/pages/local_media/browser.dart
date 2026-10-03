@@ -254,6 +254,9 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
       if (mounted) {
         setState(() => _syncProgress(_effectiveItems));
       }
+      // SAF 条目播放时导出的 fd(视频本体 + 外挂字幕)一次性回收;
+      // Kotlin 侧另有 LRU 兜底, 但主动关掉才不会把句柄攒满
+      await SafFdRegistry.releaseAll();
     } on Object catch (err) {
       SmartDialog.showToast('无法播放: $err');
     } finally {
@@ -272,6 +275,18 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
       },
       child: SimpleScaffold(
         appBar: AppBar(
+          // 第十九轮: 列表里不再有 ".." 这一行(它既占位置又容易被误点成
+          // 文件), 回上一级统一走 返回键 / 系统返回 / 面包屑。
+          leading: IconButton(
+            tooltip: _stack.length > 1 ? '上一级目录' : '返回',
+            icon: const Icon(Icons.arrow_back),
+            onPressed: () {
+              if (!_back()) {
+                Navigator.of(context).maybePop();
+              }
+            },
+          ),
+          bottom: _searching ? null : _buildBreadcrumb(),
           title: _searching
               ? TextField(
                   controller: _searchCtr,
@@ -372,22 +387,101 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
   Widget _buildList() {
     final items = _items;
     if (items.isEmpty) {
-      return HttpError(errMsg: '这里没有可播放的媒体文件', onReload: _refresh);
+      return HttpError(
+        errMsg: _emptyHint,
+        onReload: _refresh,
+      );
     }
+    // 不再有 ".." 这一行: 回上一级用 返回键 / 系统返回 / 顶部面包屑
     return SliverList.builder(
-      itemCount: items.length + (_stack.length > 1 ? 1 : 0),
-      itemBuilder: (context, index) {
-        if (_stack.length > 1 && index == 0) {
-          return ListTile(
-            leading: const Icon(Icons.drive_file_move_rtl_outlined),
-            title: const Text('..'),
-            subtitle: Text(_stack[_stack.length - 2].title),
-            onTap: _back,
-          );
-        }
-        final item = items[index - (_stack.length > 1 ? 1 : 0)];
-        return _buildItem(item);
-      },
+      itemCount: items.length,
+      itemBuilder: (context, index) => _buildItem(items[index]),
+    );
+  }
+
+  /// 空目录的提示: 直读模式在安卓 11+ 只能看到媒体文件, 必须把出路说清楚,
+  /// 否则用户只会觉得"我的文件被吃了"。
+  String get _emptyHint {
+    final source = _current.source;
+    if (LocalMediaService.isSafSource(source)) {
+      return '这个文件夹是空的';
+    }
+    if (source.type == LocalMediaSourceType.device) {
+      return '这里没有读到任何文件。\n'
+          '安卓 11+ 的直读模式只能看到媒体文件, 请在「本地」页用'
+          '「选择本机文件夹」授权后再浏览(可看到全部文件)。';
+    }
+    return '这里没有可播放的媒体文件';
+  }
+
+  /// 顶部面包屑: 当前位置 + 逐级可点回跳。
+  ///
+  /// 去掉 ".." 行之后, 这是"我在哪 / 怎么回去"的主要线索; 横向列表用
+  /// `reverse` 让**最右边**始终是当前层(路径很长时前面的层级自然被裁掉)。
+  PreferredSizeWidget _buildBreadcrumb() {
+    final theme = Theme.of(context);
+    final dim = theme.colorScheme.onSurfaceVariant;
+    return PreferredSize(
+      preferredSize: const Size.fromHeight(32),
+      child: SizedBox(
+        height: 32,
+        child: ListView(
+          scrollDirection: Axis.horizontal,
+          reverse: true,
+          padding: const EdgeInsets.symmetric(horizontal: 12),
+          children: [
+            for (var i = _stack.length - 1; i >= 0; i--) ...[
+              if (i != _stack.length - 1)
+                Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 1),
+                  child: Icon(
+                    Icons.chevron_right,
+                    size: 14,
+                    color: dim.withValues(alpha: 0.6),
+                  ),
+                ),
+              _buildCrumb(i, i == _stack.length - 1, theme),
+            ],
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildCrumb(int level, bool isCurrent, ThemeData theme) {
+    final title = _stack[level].title;
+    final color = isCurrent
+        ? theme.colorScheme.primary
+        : theme.colorScheme.onSurfaceVariant;
+    return Material(
+      type: MaterialType.transparency,
+      child: InkWell(
+        borderRadius: const BorderRadius.all(Radius.circular(6)),
+        // 点当前层没意义; 点上层直接跳回去(截断页面栈)
+        onTap: isCurrent
+            ? null
+            : () {
+                setState(() {
+                  while (_stack.length > level + 1) {
+                    _stack.removeLast();
+                  }
+                });
+                _refresh();
+              },
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 5),
+          child: Text(
+            title,
+            maxLines: 1,
+            overflow: TextOverflow.ellipsis,
+            style: TextStyle(
+              fontSize: 12,
+              color: color,
+              fontWeight: isCurrent ? FontWeight.w600 : null,
+            ),
+          ),
+        ),
+      ),
     );
   }
 
@@ -752,7 +846,12 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
     if (saved == null || target == null) {
       return false;
     }
-    return saved.any((e) => e.type == target.type && e.url == target.url);
+    return saved.any(
+      (e) =>
+          e.type == target.type &&
+          e.url == target.url &&
+          e.subPath == target.subPath,
+    );
   }
 
   Future<void> _addShortcut() async {
@@ -770,7 +869,8 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
   }
 
   void _showItemMenu(LocalMediaItem item) {
-    final masked = LocalMediaService.maskedUrl(item.uri);
+    // SAF 条目显示可读路径(内部存储/Download/…), 网络来源显示脱敏地址
+    final masked = LocalMediaService.displayPath(item);
     showDialog<void>(
       context: context,
       builder: (dialogContext) => AlertDialog(
@@ -798,7 +898,7 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
             ListTile(
               dense: true,
               leading: const Icon(Icons.link),
-              title: const Text('复制地址(不含密码)'),
+              title: const Text('复制路径/地址(不含密码)'),
               onTap: () {
                 Navigator.of(dialogContext).pop();
                 Clipboard.setData(ClipboardData(text: masked));

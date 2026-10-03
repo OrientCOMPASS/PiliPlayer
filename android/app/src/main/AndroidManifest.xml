@@ -1,4 +1,5 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
     package="com.example.piliplus">
 
     <queries>
@@ -296,5 +297,15 @@
       -->
     <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
     <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <!-- 安卓 14「选择照片和视频」部分访问: 声明后 permission_handler 才能把
+         该状态报成 isLimited, 「本地」板块据此明确提示"未勾选的文件不可见" -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <!-- 「所有文件访问权限」: 本机目录浏览的可选增强(第十九轮)。
+         作用域存储下 dart:io 只能看到媒体文件, 用户会碰到"文件管理器里有、
+         应用里找不到"; 开了它之后直读模式与系统文件管理器一致。
+         默认走 SAF(系统「选择文件夹」授权), 不依赖这个权限。 -->
+    <uses-permission
+        android:name="android.permission.MANAGE_EXTERNAL_STORAGE"
+        tools:ignore="ScopedStorage" />
     <uses-permission android:name="android.permission.WRITE_SETTINGS" />
 </manifest>

@@ -96,23 +96,56 @@ class _LocalMediaPageState extends State<LocalMediaPage>
         }
 
         // ---------- 本机存储 ----------
+        // 第十九轮重写: 授权过的文件夹(SAF)排在最前, 它能看到目录里的**全部**
+        // 文件; 存储卷直读放在后面并明确标注"只能看到媒体文件", 免得用户以为
+        // 应用把他的文件吃了。
         children.add(_sectionHeader(context, '本机存储'));
+        for (final source in _controller.safSources) {
+          children.add(_buildSafTree(context, source));
+        }
         for (final source in _controller.deviceSources) {
+          children.add(_buildVolume(context, source));
+        }
+        children.add(
+          Obx(
+            () => ListTile(
+              leading: const Icon(Icons.create_new_folder_outlined),
+              title: const Text('选择本机文件夹…'),
+              subtitle: Text(
+                _controller.safSources.isEmpty
+                    ? '系统授权后可看到该文件夹里的全部文件(推荐)'
+                    : '再授权一个文件夹(已授权 ${_controller.safSources.length} 个)',
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+              trailing: _controller.pickingFolder.value
+                  ? const SizedBox(
+                      width: 18,
+                      height: 18,
+                      child: CircularProgressIndicator(strokeWidth: 2),
+                    )
+                  : const Icon(Icons.add),
+              onTap: _controller.pickingFolder.value
+                  ? null
+                  : () => _controller.pickSafFolder(),
+            ),
+          ),
+        );
+        if (!_controller.allFilesAccess.value) {
           children.add(
             ListTile(
-              leading: const Icon(Icons.storage_outlined),
-              title: Text(
-                source.name,
+              leading: const Icon(Icons.rule_folder_outlined),
+              title: const Text('开启「所有文件访问权限」'),
+              subtitle: const Text(
+                '一次性放开整个存储, 之后直读也能看全(可选)',
                 maxLines: 1,
                 overflow: TextOverflow.ellipsis,
               ),
-              subtitle: Text(
-                source.url,
-                maxLines: 1,
-                overflow: TextOverflow.ellipsis,
-              ),
-              trailing: const Icon(Icons.chevron_right),
-              onTap: () => _controller.openDevice(source),
+              trailing: const Icon(Icons.open_in_new, size: 18),
+              onTap: () async {
+                await _controller.openAllFilesSettings();
+                await _controller.refreshSafSources();
+              },
             ),
           );
         }
@@ -188,6 +221,83 @@ class _LocalMediaPageState extends State<LocalMediaPage>
           children: children,
         );
       }),
+    );
+  }
+
+  /// 已授权的 SAF 目录树
+  Widget _buildSafTree(BuildContext context, LocalMediaSource source) {
+    return ListTile(
+      leading: const Icon(Icons.folder_outlined),
+      title: Text(
+        source.name,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Text(
+        LocalMediaService.safLabel(source),
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: () => _controller.openDevice(context, source),
+      onLongPress: () => _showSafTreeMenu(context, source),
+    );
+  }
+
+  /// 存储卷(直读)。没有「所有文件访问权限」时把限制写在副标题里。
+  Widget _buildVolume(BuildContext context, LocalMediaSource source) {
+    final unrestricted = _controller.allFilesAccess.value;
+    return ListTile(
+      leading: const Icon(Icons.storage_outlined),
+      title: Text(
+        source.name,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      subtitle: Text(
+        unrestricted ? source.url : '${source.url} · 直读(只能看到媒体文件)',
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+      ),
+      trailing: const Icon(Icons.chevron_right),
+      onTap: () => _controller.openDevice(context, source),
+    );
+  }
+
+  void _showSafTreeMenu(BuildContext context, LocalMediaSource source) {
+    showDialog<void>(
+      context: context,
+      builder: (dialogContext) => AlertDialog(
+        title: Text(source.name, maxLines: 2, overflow: TextOverflow.ellipsis),
+        contentPadding: const EdgeInsets.symmetric(vertical: 8),
+        content: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.folder_open_outlined),
+              title: const Text('浏览'),
+              onTap: () {
+                Navigator.of(dialogContext).pop();
+                _controller.openDevice(context, source);
+              },
+            ),
+            ListTile(
+              dense: true,
+              leading: const Icon(Icons.link_off),
+              title: const Text('移除授权'),
+              subtitle: const Text(
+                '撤销系统授予的文件夹读取权限(不删除任何文件)',
+                style: TextStyle(fontSize: 12),
+              ),
+              onTap: () {
+                Navigator.of(dialogContext).pop();
+                _controller.removeSafSource(source);
+              },
+            ),
+          ],
+        ),
+      ),
     );
   }
 

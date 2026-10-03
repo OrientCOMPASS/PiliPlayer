@@ -1,5 +1,6 @@
 package com.example.piliplus
 
+import android.app.Activity
 import android.content.Intent
 import android.content.res.Configuration
 import android.net.Uri
@@ -8,8 +9,10 @@ import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.ParcelFileDescriptor
+import android.provider.DocumentsContract
 import android.provider.OpenableColumns
 import android.view.KeyEvent
+import android.view.MotionEvent
 import android.view.WindowManager.LayoutParams
 import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
@@ -18,10 +21,31 @@ import io.flutter.plugin.common.MethodChannel
 class MainActivity : AudioServiceActivity() {
 
     companion object {
-        // content:// 导出的 fd -> 句柄。Dart 侧播放页退出后调 closeFd 关闭;
-        // 兜底: 同时挂起的 fd 超过 4 个时关掉最旧的(防止异常路径泄漏)。
-        private val openFds = HashMap<Int, ParcelFileDescriptor>()
+        // content:// 导出的 fd -> 句柄。Dart 侧播放页退出后调 closeFd/closeAllFds
+        // 关闭; 兜底: 同时挂起的 fd 超过 MAX_OPEN_FDS 时按**打开顺序**关掉最旧的
+        // (防止异常路径泄漏)。上限从 4 提到 8: SAF 目录里播一个视频会同时挂上
+        // 视频本体与若干外挂字幕的 fd, 4 个太容易把正在用的挤掉。
+        private const val MAX_OPEN_FDS = 8
+
+        private val openFds = object : LinkedHashMap<Int, ParcelFileDescriptor>() {
+            override fun removeEldestEntry(
+                eldest: MutableMap.MutableEntry<Int, ParcelFileDescriptor>?
+            ): Boolean {
+                if (size > MAX_OPEN_FDS) {
+                    try {
+                        eldest?.value?.close()
+                    } catch (e: Throwable) {
+                    }
+                    return true
+                }
+                return false
+            }
+        }
+
+        private const val REQ_PICK_TREE = 0x5171
     }
+
+    private var pendingTreePick: MethodChannel.Result? = null
 
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
@@ -47,6 +71,8 @@ class MainActivity : AudioServiceActivity() {
             when (call.method) {
                 // 系统「用其他应用打开/分享」的视频: content:// 导出 fd,
                 // Dart 侧以 fd://N 交给 mpv(fd 协议); file:// 直接回路径。
+                // SAF(系统文件夹授权)浏览到的条目同样走这里 —— content://
+                // document uri 就是它。
                 "resolveContentMedia" -> {
                     val uriStr = call.argument<String>("uri")
                     if (uriStr == null) {
@@ -70,14 +96,7 @@ class MainActivity : AudioServiceActivity() {
                                 if (parsed.scheme == "content") {
                                     val pfd = contentResolver.openFileDescriptor(parsed, "r")
                                         ?: error("openFileDescriptor returned null")
-                                    synchronized(openFds) {
-                                        if (openFds.size >= 4) {
-                                            openFds.keys.minOrNull()?.let { oldest ->
-                                                openFds.remove(oldest)?.close()
-                                            }
-                                        }
-                                        openFds[pfd.fd] = pfd
-                                    }
+                                    synchronized(openFds) { openFds[pfd.fd] = pfd }
                                     out["fd"] = pfd.fd
                                 } else {
                                     out["path"] = parsed.path ?: ""
@@ -101,11 +120,156 @@ class MainActivity : AudioServiceActivity() {
                         }.start()
                     }
                 }
+                // 播放页退出/切换来源时一次性回收, 避免 SAF 播放把 fd 攒满
+                "closeAllFds" -> {
+                    val handler = Handler(Looper.getMainLooper())
+                    Thread {
+                        synchronized(openFds) {
+                            for (pfd in openFds.values) {
+                                try {
+                                    pfd.close()
+                                } catch (e: Throwable) {
+                                }
+                            }
+                            openFds.clear()
+                        }
+                        handler.post { result.success(true) }
+                    }.start()
+                }
+
+                // ==================== SAF 目录浏览(第十九轮) ====================
+                // 作用域存储下 dart:io 只能看到媒体文件, 用户"文件管理器里有、
+                // 应用里找不到"就是这个原因; 走系统「选择文件夹」授权后, 用
+                // DocumentsContract 列目录能看到该树下的全部条目。
+                "safSupported" -> result.success(SafBrowser.isSupported())
+
+                "safPickTree" -> {
+                    if (pendingTreePick != null) {
+                        result.error("busy", "already picking", null)
+                    } else {
+                        pendingTreePick = result
+                        try {
+                            val intent = Intent(Intent.ACTION_OPEN_DOCUMENT_TREE).apply {
+                                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+                                val initial = call.argument<String>("initialUri")
+                                if (!initial.isNullOrEmpty() &&
+                                    Build.VERSION.SDK_INT >= Build.VERSION_CODES.O
+                                ) {
+                                    try {
+                                        putExtra(
+                                            DocumentsContract.EXTRA_INITIAL_URI,
+                                            Uri.parse(initial)
+                                        )
+                                    } catch (e: Throwable) {
+                                    }
+                                }
+                            }
+                            startActivityForResult(intent, REQ_PICK_TREE)
+                        } catch (e: Throwable) {
+                            pendingTreePick = null
+                            result.error("no_picker", e.message, null)
+                        }
+                    }
+                }
+
+                "safTrees" -> onWorker(result) {
+                    SafBrowser.persistedTrees(contentResolver)
+                }
+
+                "safList" -> {
+                    val uriStr = call.argument<String>("uri")
+                    val docId = call.argument<String>("docId")
+                    if (uriStr == null) {
+                        result.error("bad_args", "uri required", null)
+                    } else {
+                        onWorker(result) {
+                            SafBrowser.listChildren(contentResolver, Uri.parse(uriStr), docId)
+                        }
+                    }
+                }
+
+                "safReleaseTree" -> {
+                    val uriStr = call.argument<String>("uri")
+                    if (uriStr == null) {
+                        result.error("bad_args", "uri required", null)
+                    } else {
+                        onWorker(result) {
+                            SafBrowser.releaseTree(contentResolver, Uri.parse(uriStr))
+                        }
+                    }
+                }
+
+                "safHasAllFilesAccess" -> onWorker(result) { SafBrowser.hasAllFilesAccess() }
+
+                "safOpenAllFilesSettings" -> result.success(
+                    SafBrowser.openAllFilesAccessSettings(this)
+                )
+
+                else -> result.notImplemented()
+            }
+        }
+
+        // 手柄摇杆是 MotionEvent 模拟轴, 不会自动进 Flutter 的按键通道;
+        // 这里缓存最新读数, VR 操作模式下由 Dart 轮询(见 Gamepad / VrControlLayer)。
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            "piliplus/gamepad"
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "readAxes" -> result.success(Gamepad.snapshot())
+                "reset" -> {
+                    Gamepad.reset()
+                    result.success(true)
+                }
                 else -> result.notImplemented()
             }
         }
     }
 
+    /** ContentResolver 查询一律离开主线程; 结果回主线程交给 Dart */
+    private fun onWorker(result: MethodChannel.Result, block: () -> Any?) {
+        val handler = Handler(Looper.getMainLooper())
+        Thread {
+            try {
+                val value = block()
+                handler.post { result.success(value) }
+            } catch (e: SafBrowser.SafException) {
+                handler.post { result.error("saf_error", e.message, null) }
+            } catch (e: Throwable) {
+                handler.post { result.error("saf_failed", e.message ?: e.toString(), null) }
+            }
+        }.start()
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        if (requestCode == REQ_PICK_TREE) {
+            val pending = pendingTreePick
+            pendingTreePick = null
+            if (pending != null) {
+                val uri = data?.data
+                if (resultCode == Activity.RESULT_OK && uri != null) {
+                    val handler = Handler(Looper.getMainLooper())
+                    Thread {
+                        try {
+                            val info = SafBrowser.persistTree(contentResolver, uri)
+                            handler.post { pending.success(info) }
+                        } catch (e: SafBrowser.SafException) {
+                            handler.post { pending.error("saf_error", e.message, null) }
+                        } catch (e: Throwable) {
+                            handler.post {
+                                pending.error("saf_failed", e.message ?: e.toString(), null)
+                            }
+                        }
+                    }.start()
+                } else {
+                    // 用户取消: 明确回 null, Dart 侧不当成错误
+                    pending.success(null)
+                }
+            }
+            return
+        }
+        super.onActivityResult(requestCode, resultCode, data)
+    }
 
     override fun onDestroy() {
         stopService(Intent(this, com.ryanheise.audioservice.AudioService::class.java))
@@ -120,6 +284,14 @@ class MainActivity : AudioServiceActivity() {
     override fun onPictureInPictureModeChanged(isInPictureInPictureMode: Boolean, newConfig: Configuration?) {
         super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
         AndroidHelper.isPipMode = isInPictureInPictureMode
+    }
+
+    override fun dispatchGenericMotionEvent(event: MotionEvent): Boolean {
+        try {
+            Gamepad.onGenericMotionEvent(event)
+        } catch (e: Throwable) {
+        }
+        return super.dispatchGenericMotionEvent(event)
     }
 
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {

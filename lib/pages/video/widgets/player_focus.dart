@@ -91,6 +91,29 @@ class PlayerFocus extends StatelessWidget {
   bool _handleKey(BuildContext context, KeyEvent event) {
     final key = event.logicalKey;
 
+    // VR 操作模式下的手柄按键(第十九轮 需求5): 三角 = 摆正视角,
+    // 方块 = 切换眼位。安卓把 PS 手柄的 △ 报成 KEYCODE_BUTTON_Y、□ 报成
+    // KEYCODE_BUTTON_X(Xbox 手柄上就是 Y / X), Flutter 侧对应
+    // gameButtonY / gameButtonX。
+    //
+    // 这两个键在 VR 模式下**优先吃掉**, 并且不去点亮控件层 —— 手柄环视时
+    // 弹出播放器 UI 只会挡住画面与 VR 按钮(需求原文: 手柄操作不应唤起
+    // 播放器 UI)。摇杆部分见 VrControlLayer 的 GamepadPoller。
+    if (plPlayerController.vrControlMode.value) {
+      if (key == LogicalKeyboardKey.gameButtonY) {
+        if (event is KeyDownEvent && !event.repeat) {
+          plPlayerController.resetVrView();
+        }
+        return true;
+      }
+      if (key == LogicalKeyboardKey.gameButtonX) {
+        if (event is KeyDownEvent && !event.repeat) {
+          plPlayerController.toggleVrEye();
+        }
+        return true;
+      }
+    }
+
     final isKeyQ = key == LogicalKeyboardKey.keyQ;
     if (isKeyQ || key == LogicalKeyboardKey.keyR) {
       if (HardwareKeyboard.instance.isMetaPressed) {

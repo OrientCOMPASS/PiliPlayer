@@ -15,6 +15,7 @@ import 'package:PiliPlus/common/widgets/scroll_behavior.dart'
 import 'package:PiliPlus/common/widgets/scroll_physics.dart'
     show tabBarView, platformAlwaysClampingPhysics, platformClampingPhysics;
 import 'package:PiliPlus/common/widgets/simple_app_bar.dart';
+import 'package:PiliPlus/common/widgets/sliver/sliver_pinned_header.dart';
 import 'package:PiliPlus/common/widgets/sliver/video_header.dart';
 import 'package:PiliPlus/common/widgets/svg/play_icon.dart';
 import 'package:PiliPlus/models/common/episode_panel_type.dart';
@@ -360,7 +361,13 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       showSystemBar();
     }
 
-    if (!videoDetailController.plPlayerController.isCloseAll) {
+    final playerCtr = videoDetailController.plPlayerController;
+    if (playerCtr.floatingKeepAlive) {
+      // 应用内画中画(第十九轮 需求3): 页面出栈但播放器要活着继续在浮窗里播。
+      // 心跳照常上报(这次播放该算进历史), 播放器由 FloatingPlayerService
+      // 负责后续销毁或交还给重新打开的播放页。
+      videoDetailController.makeHeartBeat();
+    } else if (!playerCtr.isCloseAll) {
       videoPlayerServiceHandler?.onVideoDetailDispose(heroTag);
       if (plPlayerController != null) {
         videoDetailController.makeHeartBeat();
@@ -1651,8 +1658,16 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       physics: !needCtr ? platformAlwaysClampingPhysics : null,
       key: const PageStorageKey(CommonIntroController),
       slivers: [
+        // 播放列表表头(第十九轮): 条目计数 + 快速检索。pinned 让检索框在
+        // 长列表里滚动时也一直在手边; 列表切集时会自动滚到正在播的那一条。
+        SliverPinnedHeader(
+          backgroundColor: colorScheme.surface,
+          child: LocalMediaPlaylistHeader(heroTag: heroTag),
+        ),
         SliverPadding(
-          padding: EdgeInsets.only(top: 7, bottom: padding.bottom + 100),
+          // 顶部不留白: 表头是 pinned 的, 列表偏移 = 表头高度 + index * 行高,
+          // 自动滚动到"正在播"那条时按这个公式算, 多一段 padding 就会偏。
+          padding: EdgeInsets.only(bottom: padding.bottom + 100),
           sliver: LocalMediaIntroPanel(
             key: videoRelatedKey,
             heroTag: heroTag,

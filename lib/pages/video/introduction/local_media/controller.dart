@@ -47,6 +47,31 @@ class LocalMediaIntroController extends CommonIntroController {
 
   final RxInt index = (-1).obs;
 
+  /// 播放列表表头的快速检索关键词(第十九轮新增)。
+  ///
+  /// 只过滤**展示**, 不改变 [list] 本身: 上一个/下一个、列表循环、随机播放
+  /// 依旧走完整列表, 检索只是"在几十上百个文件里快速定位那一个"。
+  final RxString query = ''.obs;
+
+  /// 过滤后仍然展示的条目在 [list] 中的下标(关键词为空 = 全量、原序)
+  List<int> get visibleIndices {
+    final keyword = query.value.trim().toLowerCase();
+    if (keyword.isEmpty) {
+      return [for (var i = 0; i < list.length; i++) i];
+    }
+    return [
+      for (var i = 0; i < list.length; i++)
+        if (list[i].name.toLowerCase().contains(keyword)) i,
+    ];
+  }
+
+  /// 正在播的条目在**过滤后**列表里的位置; 被过滤掉时返回 -1
+  int get visibleIndexOfCurrent => visibleIndices.indexOf(index.value);
+
+  void setQuery(String value) => query.value = value;
+
+  void clearQuery() => query.value = '';
+
   @override
   void onInit() {
     super.onInit();

@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  为什么需要这个文件:
+
+  「本地」板块要连用户自己的局域网服务器 —— SMB 走**本机回环 HTTP 代理**
+  (127.0.0.1, 因为打包的 FFmpeg 没有 smb 协议), WebDAV/HTTP 直链则常常是
+  没有证书的 http:// NAS 地址。
+
+  mpv/FFmpeg 自己做 socket, 不受安卓明文流量策略约束, 所以以前一直能播;
+  但**自研 VR 播放器用的是 MediaExtractor**, 它走系统 HTTP 栈
+  (MediaHTTPService), 从 Android 9 起默认禁止明文 http -> SMB/局域网源
+  在 VR 播放器里会直接打不开。这里显式放开明文。
+
+  影响面: 只是"允许"明文, 不会把任何 https 请求降级; B 站接口全是 https,
+  行为不变。
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true" />
+</network-security-config>

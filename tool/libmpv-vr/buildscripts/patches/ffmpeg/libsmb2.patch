@@ -1,0 +1,450 @@
+diff --git a/configure b/configure
+index 374bd5c..718cfd4 100755
+--- a/configure
++++ b/configure
+@@ -274,6 +274,7 @@ External library support:
+   --enable-librubberband   enable rubberband needed for rubberband filter [no]
+   --enable-librtmp         enable RTMP[E] support via librtmp [no]
+   --enable-libshine        enable fixed-point MP3 encoding via libshine [no]
++  --enable-libsmb2         enable SMB2/SMB3 protocol via libsmb2 [no]
+   --enable-libsmbclient    enable Samba protocol via libsmbclient [no]
+   --enable-libsnappy       enable Snappy compression, needed for hap encoding [no]
+   --enable-libsoxr         enable Include libsoxr resampling [no]
+@@ -2121,6 +2122,7 @@ EXTERNAL_LIBRARY_LIST="
+     librsvg
+     librtmp
+     libshine
++    libsmb2
+     libsmbclient
+     libsnappy
+     libsoxr
+@@ -4131,6 +4133,8 @@ librtmpe_protocol_deps="librtmp"
+ librtmps_protocol_deps="librtmp"
+ librtmpt_protocol_deps="librtmp"
+ librtmpte_protocol_deps="librtmp"
++libsmb2_protocol_deps="libsmb2"
++libsmb2_protocol_select="network"
+ libsmbclient_protocol_deps="libsmbclient gplv3"
+ libsrt_protocol_deps="libsrt"
+ libsrt_protocol_select="network"
+@@ -7433,6 +7437,7 @@ enabled librsvg           && require_pkg_config librsvg librsvg-2.0 librsvg-2.0/
+ enabled librtmp           && require_pkg_config librtmp librtmp librtmp/rtmp.h RTMP_Socket
+ enabled librubberband     && require_pkg_config librubberband "rubberband >= 1.8.1" rubberband/rubberband-c.h rubberband_new -lstdc++ && append librubberband_extralibs "-lstdc++"
+ enabled libshine          && require_pkg_config libshine shine shine/layer3.h shine_encode_buffer
++enabled libsmb2           && require_pkg_config libsmb2 libsmb2 smb2/libsmb2.h smb2_init_context
+ enabled libsmbclient      && { check_pkg_config libsmbclient smbclient libsmbclient.h smbc_init ||
+                                require libsmbclient libsmbclient.h smbc_init -lsmbclient; }
+ enabled libsnappy         && require libsnappy snappy-c.h snappy_compress -lsnappy -lstdc++
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 0d2e757..6ce7228 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -740,6 +740,7 @@ OBJS-$(CONFIG_LIBRTMPE_PROTOCOL)         += librtmp.o
+ OBJS-$(CONFIG_LIBRTMPS_PROTOCOL)         += librtmp.o
+ OBJS-$(CONFIG_LIBRTMPT_PROTOCOL)         += librtmp.o
+ OBJS-$(CONFIG_LIBRTMPTE_PROTOCOL)        += librtmp.o
++OBJS-$(CONFIG_LIBSMB2_PROTOCOL)          += libsmb2.o
+ OBJS-$(CONFIG_LIBSMBCLIENT_PROTOCOL)     += libsmbclient.o
+ OBJS-$(CONFIG_LIBSRT_PROTOCOL)           += libsrt.o
+ OBJS-$(CONFIG_LIBSSH_PROTOCOL)           += libssh.o
+diff --git a/libavformat/libsmb2.c b/libavformat/libsmb2.c
+new file mode 100644
+index 0000000..e9a4b96
+--- /dev/null
++++ b/libavformat/libsmb2.c
+@@ -0,0 +1,383 @@
++/*
++ * SMB2/SMB3 protocol via libsmb2
++ * Copyright (c) 2026 PiliPlus contributors
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * SMB2/SMB3 protocol via libsmb2 -- the same library VLC uses for its smb
++ * access module. Unlike the libsmbclient-based protocol this does not pull
++ * in Samba (GPLv3 + a very heavy dependency chain); libsmb2 is a small
++ * LGPL client that cross-compiles cleanly for Android.
++ *
++ * URL syntax:
++ *   smb://[[<domain>;][<user>[:<password>]@]<host>[:<port>]]/<share>[/<path>]
++ *
++ * Every component may be percent-encoded and is decoded before use (the
++ * password is never logged). Read-only; seeking is a positioned read on the
++ * same open file handle -- no reconnect -- which gives VLC-like random
++ * access behaviour (cheap seeks, one session for the whole playback).
++ */
++
++#include <fcntl.h>
++#include <limits.h>
++#include <stddef.h>
++#include <stdint.h>
++#include <string.h>
++#include <time.h>
++
++/* The libsmb2 headers are not self-contained upstream: <time.h>/<stdint.h>
++ * are guarded behind the library's own build-time defines and libsmb2.h
++ * relies on smb2.h being included first (see our scripts/libsmb2.sh which
++ * patches the installed headers). Include everything explicitly so this
++ * file also compiles against pristine headers. */
++#include <smb2/smb2.h>
++#include <smb2/libsmb2.h>
++
++#include "libavutil/avstring.h"
++#include "libavutil/error.h"
++#include "libavutil/mem.h"
++#include "libavutil/opt.h"
++#include "url.h"
++
++typedef struct SMB2Context {
++    const AVClass *class;
++    struct smb2_context *smb2;
++    struct smb2fh *fh;
++    int64_t filesize;
++    int timeout;
++} SMB2Context;
++
++static int hex_val(char c)
++{
++    if (c >= '0' && c <= '9')
++        return c - '0';
++    if (c >= 'a' && c <= 'f')
++        return c - 'a' + 10;
++    if (c >= 'A' && c <= 'F')
++        return c - 'A' + 10;
++    return -1;
++}
++
++/* Percent-decode in place. Returns 0, or AVERROR(EINVAL) on a bad escape. */
++static int url_decode(char *s)
++{
++    char *r = s, *w = s;
++    while (*r) {
++        if (*r == '%') {
++            int hi, lo;
++            if (!r[1] || !r[2] || (hi = hex_val(r[1])) < 0 || (lo = hex_val(r[2])) < 0)
++                return AVERROR(EINVAL);
++            *w++ = (char)((hi << 4) | lo);
++            r += 3;
++        } else {
++            *w++ = *r++;
++        }
++    }
++    *w = '\0';
++    return 0;
++}
++
++static int dup_decode(char **dst, const char *src, size_t len)
++{
++    char *s = av_strndup(src, len);
++    if (!s)
++        return AVERROR(ENOMEM);
++    if (url_decode(s) < 0) {
++        av_free(s);
++        return AVERROR(EINVAL);
++    }
++    *dst = s;
++    return 0;
++}
++
++/**
++ * Split smb://[domain;][user[:password]@]host[:port]/share/path into freshly
++ * allocated, percent-decoded components. Optional components are NULL.
++ * host keeps its ":port" suffix -- libsmb2 parses that itself.
++ */
++static int parse_smb_url(const char *url, char **domain, char **user,
++                         char **password, char **host, char **share,
++                         char **path)
++{
++    const char *p, *auth_end;
++    char *authority = NULL, *sp = NULL, *at, *semi, *colon, *slash, *q;
++    int ret;
++
++    *domain = *user = *password = *host = *share = *path = NULL;
++
++    if (!av_strstart(url, "smb://", &p))
++        return AVERROR(EINVAL);
++    auth_end = strchr(p, '/');
++    if (!auth_end || auth_end == p)  /* need host + /share */
++        return AVERROR(EINVAL);
++
++    authority = av_strndup(p, auth_end - p);
++    sp = av_strdup(auth_end + 1);
++    if (!authority || !sp) {
++        ret = AVERROR(ENOMEM);
++        goto fail;
++    }
++
++    /* an (unsupported) query part must not leak into the path */
++    q = strchr(sp, '?');
++    if (q)
++        *q = '\0';
++
++    /* share / path */
++    slash = strchr(sp, '/');
++    if (slash) {
++        *slash = '\0';
++        ret = dup_decode(path, slash + 1, strlen(slash + 1));
++    } else {
++        ret = dup_decode(path, "", 0);
++    }
++    if (ret < 0)
++        goto fail;
++    ret = dup_decode(share, sp, strlen(sp));
++    if (ret < 0 || !**share) {
++        ret = AVERROR(EINVAL);
++        goto fail;
++    }
++
++    /* authority: [domain;][user[:password]@]host[:port] */
++    at = strrchr(authority, '@');
++    {
++        char *hostpart = authority;
++        if (at) {
++            char *cred = authority;
++            *at = '\0';
++            hostpart = at + 1;
++            semi = strchr(cred, ';');
++            if (semi) {
++                *semi = '\0';
++                ret = dup_decode(domain, cred, strlen(cred));
++                if (ret < 0)
++                    goto fail;
++                cred = semi + 1;
++            }
++            colon = strchr(cred, ':');
++            if (colon) {
++                *colon = '\0';
++                ret = dup_decode(password, colon + 1, strlen(colon + 1));
++                if (ret < 0)
++                    goto fail;
++            }
++            ret = dup_decode(user, cred, strlen(cred));
++            if (ret < 0)
++                goto fail;
++        }
++        if (!*hostpart) {
++            ret = AVERROR(EINVAL);
++            goto fail;
++        }
++        ret = dup_decode(host, hostpart, strlen(hostpart));
++        if (ret < 0)
++            goto fail;
++    }
++
++    av_free(authority);
++    av_free(sp);
++    return 0;
++
++fail:
++    av_free(authority);
++    av_free(sp);
++    av_freep(domain);
++    av_freep(user);
++    av_freep(password);
++    av_freep(host);
++    av_freep(share);
++    av_freep(path);
++    return ret;
++}
++
++static av_cold int smb2_proto_open(URLContext *h, const char *url, int flags)
++{
++    SMB2Context *c = h->priv_data;
++    char *domain = NULL, *user = NULL, *password = NULL;
++    char *host = NULL, *share = NULL, *path = NULL;
++    int connected = 0, ret;
++
++    if (flags & AVIO_FLAG_WRITE) {
++        av_log(h, AV_LOG_ERROR, "Write support is not available.\n");
++        return AVERROR(ENOSYS);
++    }
++
++    ret = parse_smb_url(url, &domain, &user, &password, &host, &share, &path);
++    if (ret < 0) {
++        /* never log the full url: it can carry the password */
++        av_log(h, AV_LOG_ERROR, "Malformed smb:// url.\n");
++        goto out;
++    }
++
++    c->filesize = -1;
++    c->smb2 = smb2_init_context();
++    if (!c->smb2) {
++        ret = AVERROR(ENOMEM);
++        goto out;
++    }
++    if (c->timeout > 0)
++        smb2_set_timeout(c->smb2, c->timeout);
++    if (user && *user) {
++        smb2_set_user(c->smb2, user);
++        /* SMB2_BLANK_PW: libsmb2 treats a NULL password as "log in
++         * anonymously" (ntlmssp.c: password == NULL -> anonymous), which
++         * servers reject for real accounts with a blank password (observed:
++         * Windows answers SESSION_SETUP with STATUS_INVALID_PARAMETER).
++         * Passing "" explicitly produces proper NTLMv2 over the empty
++         * password, matching what other clients (VLC, our Dart browse
++         * client) do. */
++        smb2_set_password(c->smb2, password ? password : "");
++    } else if (password) {
++        smb2_set_password(c->smb2, password);
++    }
++    if (domain && *domain)
++        smb2_set_domain(c->smb2, domain);
++
++    if (smb2_connect_share(c->smb2, host, share, NULL) < 0) {
++        av_log(h, AV_LOG_ERROR, "Failed to connect to //%s/%s: %s\n",
++               host, share, smb2_get_error(c->smb2));
++        ret = AVERROR(EIO);
++        goto out;
++    }
++    connected = 1;
++
++    c->fh = smb2_open(c->smb2, *path ? path : "\\", O_RDONLY);
++    if (!c->fh) {
++        av_log(h, AV_LOG_ERROR, "Failed to open /%s on //%s/%s: %s\n",
++               path, host, share, smb2_get_error(c->smb2));
++        ret = AVERROR(EIO);
++        goto out;
++    }
++
++    {
++        struct smb2_stat_64 st;
++        if (smb2_fstat(c->smb2, c->fh, &st) == 0)
++            c->filesize = st.smb2_size;
++        else {
++            av_log(h, AV_LOG_WARNING, "Cannot stat file: %s\n",
++                   smb2_get_error(c->smb2));
++            h->is_streamed = 1;
++        }
++    }
++
++    ret = 0;
++
++out:
++    if (ret < 0 && c->smb2) {
++        if (c->fh) {
++            smb2_close(c->smb2, c->fh);
++            c->fh = NULL;
++        }
++        if (connected)
++            smb2_disconnect_share(c->smb2);
++        smb2_destroy_context(c->smb2);
++        c->smb2 = NULL;
++    }
++    av_free(domain);
++    av_free(user);
++    av_free(password);
++    av_free(host);
++    av_free(share);
++    av_free(path);
++    return ret;
++}
++
++static int smb2_proto_read(URLContext *h, unsigned char *buf, int size)
++{
++    SMB2Context *c = h->priv_data;
++    int rc;
++
++    if (size <= 0)
++        return 0;
++    rc = smb2_read(c->smb2, c->fh, buf, size);
++    if (rc < 0) {
++        av_log(h, AV_LOG_ERROR, "Read failed: %s\n", smb2_get_error(c->smb2));
++        return AVERROR(EIO);
++    }
++    return rc ? rc : AVERROR_EOF;
++}
++
++static int64_t smb2_proto_seek(URLContext *h, int64_t pos, int whence)
++{
++    SMB2Context *c = h->priv_data;
++    int64_t newpos;
++
++    if (whence == AVSEEK_SIZE) {
++        if (c->filesize < 0) {
++            av_log(h, AV_LOG_ERROR,
++                   "Error during seeking: filesize is unknown.\n");
++            return AVERROR(EIO);
++        }
++        return c->filesize;
++    }
++
++    newpos = smb2_lseek(c->smb2, c->fh, pos, whence, NULL);
++    if (newpos < 0) {
++        av_log(h, AV_LOG_ERROR, "Error during seeking: %s\n",
++               smb2_get_error(c->smb2));
++        return AVERROR(EIO);
++    }
++    return newpos;
++}
++
++static av_cold int smb2_proto_close(URLContext *h)
++{
++    SMB2Context *c = h->priv_data;
++
++    if (c->smb2) {
++        if (c->fh) {
++            smb2_close(c->smb2, c->fh);
++            c->fh = NULL;
++        }
++        smb2_disconnect_share(c->smb2);
++        smb2_destroy_context(c->smb2);
++        c->smb2 = NULL;
++    }
++    return 0;
++}
++
++#define OFFSET(x) offsetof(SMB2Context, x)
++#define D AV_OPT_FLAG_DECODING_PARAM
++static const AVOption options[] = {
++    { "timeout", "per-command timeout in seconds, 0 disables",
++      OFFSET(timeout), AV_OPT_TYPE_INT, { .i64 = 10 }, 0, INT_MAX, D },
++    { NULL }
++};
++#undef OFFSET
++#undef D
++
++static const AVClass libsmb2_context_class = {
++    .class_name = "smb",
++    .item_name  = av_default_item_name,
++    .option     = options,
++    .version    = LIBAVUTIL_VERSION_INT,
++};
++
++const URLProtocol ff_libsmb2_protocol = {
++    .name                = "smb",
++    .url_open            = smb2_proto_open,
++    .url_read            = smb2_proto_read,
++    .url_seek            = smb2_proto_seek,
++    .url_close           = smb2_proto_close,
++    .priv_data_size      = sizeof(SMB2Context),
++    .priv_data_class     = &libsmb2_context_class,
++    .flags               = URL_PROTOCOL_FLAG_NETWORK,
++};
+diff --git a/libavformat/protocols.c b/libavformat/protocols.c
+index 257b419..c1e0d55 100644
+--- a/libavformat/protocols.c
++++ b/libavformat/protocols.c
+@@ -75,6 +75,7 @@ extern const URLProtocol ff_librtmpt_protocol;
+ extern const URLProtocol ff_librtmpte_protocol;
+ extern const URLProtocol ff_libsrt_protocol;
+ extern const URLProtocol ff_libssh_protocol;
++extern const URLProtocol ff_libsmb2_protocol;
+ extern const URLProtocol ff_libsmbclient_protocol;
+ extern const URLProtocol ff_libzmq_protocol;
+ extern const URLProtocol ff_ipfs_gateway_protocol;

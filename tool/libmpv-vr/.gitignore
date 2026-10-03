@@ -1,0 +1,7 @@
+buildscripts/deps/
+buildscripts/sdk/
+buildscripts/prefix/
+buildscripts/scripts/ffmpeg.sh
+libmpv/
+output/
+*.tgz

@@ -1,0 +1,2413 @@
+diff --git a/meson.build b/meson.build
+index fb10be5..04dfbc9 100644
+--- a/meson.build
++++ b/meson.build
+@@ -237,6 +237,8 @@ sources = files(
+     'video/out/gpu/utils.c',
+     'video/out/gpu/video.c',
+     'video/out/gpu/video_shaders.c',
++    'video/out/gpu/vr.c',
++    'video/out/gpu/vr_tracker.c',
+     'video/out/libmpv_sw.c',
+     'video/out/vo.c',
+     'video/out/vo_gpu.c',
+diff --git a/video/out/gpu/video.c b/video/out/gpu/video.c
+index c0a1be8..9b66083 100644
+--- a/video/out/gpu/video.c
++++ b/video/out/gpu/video.c
+@@ -20,6 +20,7 @@
+ #include <math.h>
+ #include <stdarg.h>
+ #include <stdbool.h>
++#include <stdio.h>
+ #include <string.h>
+ 
+ #include <libavutil/common.h>
+@@ -39,6 +40,7 @@
+ #include "video_shaders.h"
+ #include "user_shaders.h"
+ #include "error_diffusion.h"
++#include "vr.h"
+ #include "video/out/filter_kernels.h"
+ #include "video/out/aspect.h"
+ #include "video/out/dither.h"
+@@ -204,6 +206,17 @@ struct gl_video {
+     struct ra_tex *error_diffusion_tex[2];
+     struct ra_tex *screen_tex;
+     struct ra_tex *output_tex;
++
++    // VR reprojection state (PiliPlus, see vr.c). vr_flat_tex holds the fully
++    // composited flat frame which is then projected onto the sphere.
++    struct vr_ctx *vr;
++    struct ra_tex *vr_flat_tex;
++    // Last-seen contents of the option cache, used to tell "only VR view
++    // parameters changed" apart from real reinit-worthy changes. Comparing
++    // against p->opts instead would misfire whenever check_gl_features()
++    // adjusted p->opts (dumb-mode whitelist, compute-peak fallback, ...).
++    struct gl_video_opts opts_cache_copy;
++
+     struct ra_tex **hook_textures;
+     int num_hook_textures;
+     int idx_hook_textures;
+@@ -410,6 +423,10 @@ static const struct gl_video_opts gl_video_opts_def = {
+     .shader_cache = true,
+     .hwdec_interop = "auto",
+     .treat_srgb_as_power22 = 1|2|4, // auto
++    .vr_layout = VR_LAYOUT_MONO,
++    .vr_projection = VR_PROJ_360,
++    .vr_eye = 0,
++    .vr_fov = 90.0f,
+ };
+ 
+ static OPT_STRING_VALIDATE_FUNC(validate_error_diffusion_opt);
+@@ -556,6 +573,27 @@ const struct m_sub_options gl_video_conf = {
+         {"gpu-shader-cache-dir", OPT_STRING(shader_cache_dir), .flags = M_OPT_FILE},
+         {"gpu-hwdec-interop",
+             OPT_STRING_VALIDATE(hwdec_interop, ra_hwdec_validate_opt)},
++        // VR / panoramic video (PiliPlus). Rendered after the normal video
++        // chain: the flat composited frame is reprojected onto a sphere.
++        // The view parameters (yaw/pitch/fov/reset/head-tracking) are "hot":
++        // changing them must not rebuild the render chain (see
++        // gl_video_update_options).
++        {"vr", OPT_BOOL(vr)},
++        {"vr-layout", OPT_CHOICE(vr_layout,
++            {"mono", VR_LAYOUT_MONO},
++            {"sbs", VR_LAYOUT_SBS},
++            {"tb", VR_LAYOUT_TB})},
++        {"vr-projection", OPT_CHOICE(vr_projection,
++            {"360", VR_PROJ_360},
++            {"180", VR_PROJ_180})},
++        {"vr-eye", OPT_CHOICE(vr_eye, {"left", 0}, {"right", 1})},
++        {"vr-stereo-output", OPT_BOOL(vr_stereo_output)},
++        {"vr-fov", OPT_FLOAT(vr_fov), M_RANGE(10.0, 180.0)},
++        {"vr-yaw", OPT_FLOAT(vr_yaw), M_RANGE(-360.0, 360.0)},
++        {"vr-pitch", OPT_FLOAT(vr_pitch), M_RANGE(-90.0, 90.0)},
++        {"vr-head-tracking", OPT_BOOL(vr_head_tracking)},
++        {"vr-reset-view", OPT_INT(vr_reset_view)},
++        {"vr-view", OPT_STRING(vr_view)},
+         {"gamut-warning", OPT_REMOVED("Replaced by --gamut-mapping-mode=warn")},
+         {"gamut-clipping", OPT_REMOVED("Replaced by --gamut-mapping-mode=desaturate")},
+         {"tone-mapping-desaturate", OPT_REMOVED("Replaced by --tone-mapping-mode")},
+@@ -575,6 +613,7 @@ static void reinit_from_options(struct gl_video *p);
+ static void get_scale_factors(struct gl_video *p, bool transpose_rot, double xy[2]);
+ static void gl_video_setup_hooks(struct gl_video *p);
+ static void gl_video_update_options(struct gl_video *p);
++static void vr_parse_view_string(struct gl_video_opts *opts);
+ 
+ #define GLSL(x) gl_sc_add(p->sc, #x "\n");
+ #define GLSLF(...) gl_sc_addf(p->sc, __VA_ARGS__)
+@@ -666,6 +705,7 @@ static void uninit_rendering(struct gl_video *p)
+     ra_tex_free(p->ra, &p->blend_subs_tex);
+     ra_tex_free(p->ra, &p->screen_tex);
+     ra_tex_free(p->ra, &p->output_tex);
++    ra_tex_free(p->ra, &p->vr_flat_tex);
+ 
+     for (int n = 0; n < 2; n++)
+         ra_tex_free(p->ra, &p->error_diffusion_tex[n]);
+@@ -3206,8 +3246,24 @@ static void pass_draw_to_screen(struct gl_video *p, const struct ra_fbo *fbo, in
+ 
+     if (flags & RENDER_SCREEN_COLOR)
+         pass_dither(p, fbo);
+-    pass_describe(p, "output to screen");
+-    finish_pass_fbo(p, fbo, false, &p->dst_rect);
++
++    if (p->opts.vr && !p->dumb_mode) {
++        // VR / panoramic reprojection (PiliPlus): finish the normal chain
++        // into an intermediate texture holding the flat composited frame,
++        // then reproject it onto a sphere (mono) or a Cardboard stereo pair
++        // covering the whole output. See vr.c for details.
++        int o_w = p->dst_rect.x1 - p->dst_rect.x0,
++            o_h = p->dst_rect.y1 - p->dst_rect.y0;
++        pass_describe(p, "vr flat frame");
++        finish_pass_tex(p, &p->vr_flat_tex, o_w, o_h);
++        if (p->vr_flat_tex) {
++            pass_describe(p, "vr reprojection");
++            vr_draw(p->vr, p->sc, p->ra, p->vr_flat_tex, fbo, &p->opts);
++        }
++    } else {
++        pass_describe(p, "output to screen");
++        finish_pass_fbo(p, fbo, false, &p->dst_rect);
++    }
+ }
+ 
+ // flags: bit set of RENDER_FRAME_* flags
+@@ -3445,7 +3501,10 @@ void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame,
+     }
+ 
+     if (has_frame) {
+-        bool interpolate = p->opts.interpolation && frame->display_synced &&
++        // VR reprojection is view-dependent per frame; interpolation (which
++        // renders mixed frames straight to the fbo) is not combined with it.
++        bool interpolate = !p->opts.vr && p->opts.interpolation &&
++                           frame->display_synced &&
+                            (p->frames_drawn || !frame->still);
+         if (interpolate) {
+             double ratio = frame->ideal_frame_duration / frame->vsync_interval;
+@@ -3473,7 +3532,14 @@ void gl_video_render_frame(struct gl_video *p, struct vo_frame *frame,
+                 // texture to speed up subsequent re-draws (if any exist)
+                 bool repeats = frame->num_vsyncs > 1 && frame->display_synced;
+                 bool r = false;
++                // Under VR with head tracking the output changes every frame
++                // (device pose), so caching is impossible then. With manual
++                // look the rendered frame only changes when the view options
++                // change - and those invalidate output_tex_valid below - so
++                // repeats/still frames (paused, OSD-only updates, <display Hz
++                // content at speed 1.x) can use the cheap blit like non-VR.
+                 if ((repeats || frame->still) && !p->dumb_mode &&
++                    (!p->opts.vr || !p->opts.vr_head_tracking) &&
+                     (p->ra->caps & RA_CAP_BLIT) && fbo->tex->params.blit_dst)
+                 {
+                     // Attempt to use the same format as the destination FBO
+@@ -3515,7 +3581,12 @@ done:
+ 
+     debug_check_gl(p, "after video rendering");
+ 
+-    if (p->osd && (flags & (RENDER_FRAME_SUBS | RENDER_FRAME_OSD))) {
++    // VR stereo (Cardboard) output: flat OSD across both eye views would be
++    // unwatchable, so skip it. Mono VR keeps normal flat OSD on top of the
++    // projected view (subtitles stay readable).
++    if (p->osd && (flags & (RENDER_FRAME_SUBS | RENDER_FRAME_OSD)) &&
++        !(p->opts.vr && p->opts.vr_stereo_output))
++    {
+         // If we haven't actually drawn anything so far, then we technically
+         // need to consider this the start of a new pass. Let's call it a
+         // redraw just because, since it's basically a blank frame anyway
+@@ -3847,6 +3918,14 @@ static bool check_dumb_mode(struct gl_video *p)
+     struct gl_video_opts *o = &p->opts;
+     if (p->use_integer_conversion)
+         return false;
++    // VR_DUMB_FIX (PiliPlus): VR reprojection renders through the full chain
++    // (intermediate FBO + sphere mesh draw in pass_draw_to_screen), so it is
++    // never compatible with the "no advanced processing" dumb-mode shortcut.
++    // Without this, clients whose options happen to look "fast" (media_kit on
++    // Android sets bilinear scaling and disables dither/downscaling extras)
++    // would silently end up in dumb mode and VR would stay flat.
++    if (o->vr)
++        return false;
+     if (o->dumb_mode > 0) // requested by user
+         return true;
+     if (o->dumb_mode < 0) // disabled by user
+@@ -3953,6 +4032,14 @@ static void check_gl_features(struct gl_video *p)
+     p->forced_dumb_mode = p->opts.dumb_mode > 0 || !have_fbo || !have_texrg;
+     bool voluntarily_dumb = check_dumb_mode(p);
+     if (p->forced_dumb_mode || voluntarily_dumb) {
++        // VR_DUMB_FIX (PiliPlus): VR can only survive here if dumb mode is
++        // *forced* (no usable FBOs / user override). Say so loudly instead of
++        // silently dropping back to flat rendering.
++        if (p->opts.vr) {
++            MP_WARN(p, "VR reprojection requested but dumb mode is forced "
++                       "(gpu-dumb-mode=%d, have_fbo=%d); VR stays disabled.\n",
++                    p->opts.dumb_mode, have_fbo);
++        }
+         if (voluntarily_dumb) {
+             MP_VERBOSE(p, "No advanced processing required. Enabling dumb mode.\n");
+         } else if (p->opts.dumb_mode <= 0) {
+@@ -4084,6 +4171,7 @@ void gl_video_uninit(struct gl_video *p)
+ 
+     uninit_video(p);
+     ra_hwdec_ctx_uninit(&p->hwdec_ctx);
++    vr_destroy(&p->vr, p->ra);
+     gl_sc_destroy(p->sc);
+ 
+     ra_tex_free(p->ra, &p->lut_3d_texture);
+@@ -4120,6 +4208,18 @@ bool gl_video_showing_interpolated_frame(struct gl_video *p)
+     return p->is_interpolated;
+ }
+ 
++// Whether the VR renderer needs the VO to keep redrawing even while paused
++// (head tracking updates the view pose every frame).
++bool gl_video_vr_needs_redraw(struct gl_video *p)
++{
++    return p->opts.vr && p->opts.vr_head_tracking;
++}
++
++bool gl_video_vr_view_angles(struct gl_video *p, double *yaw, double *pitch)
++{
++    return vr_get_view_angles(p->vr, yaw, pitch);
++}
++
+ static bool is_imgfmt_desc_supported(struct gl_video *p,
+                                      const struct ra_imgfmt_desc *desc)
+ {
+@@ -4154,6 +4254,9 @@ void gl_video_config(struct gl_video *p, struct mp_image_params *params)
+         p->image_params = *params;
+         if (params->imgfmt)
+             init_video(p);
++        // VR_GYRO_CONT: a different video stream restarts the manual zero
++        // point (the client re-zeroes its view offsets per file).
++        vr_new_stream(p->vr);
+     }
+ 
+     gl_video_reset_surfaces(p);
+@@ -4181,9 +4284,12 @@ struct gl_video *gl_video_init(struct ra *ra, struct mp_log *log,
+     };
+     // make sure this variable is initialized to *something*
+     p->pass = p->pass_fresh;
++    p->vr = vr_create(p, log);
+     struct gl_video_opts *opts = p->opts_cache->opts;
+     p->cms = gl_lcms_init(p, log, g, opts->icc_opts),
+     p->opts = *opts;
++    p->opts_cache_copy = *opts;
++    vr_parse_view_string(&p->opts);
+     for (int n = 0; n < SCALER_COUNT; n++)
+         p->scaler[n] = (struct scaler){.index = n};
+     // our VAO always has the vec2 position as the first element
+@@ -4199,11 +4305,96 @@ struct gl_video *gl_video_init(struct ra *ra, struct mp_log *log,
+     return p;
+ }
+ 
++// Parse the packed "yaw=..,pitch=..,fov=.." view string (option vr-view)
++// over the scalar view fields, so a client can update all continuous view
++// parameters with a single property set (see video.h). Values are clamped to
++// the same ranges as the scalar options; the coverage/pole bounds are
++// applied per frame in vr_manual_angles() as usual.
++static void vr_parse_view_string(struct gl_video_opts *opts)
++{
++    if (!opts->vr_view || !opts->vr_view[0])
++        return;
++    float y, p, f;
++    if (sscanf(opts->vr_view, "yaw=%f,pitch=%f,fov=%f", &y, &p, &f) != 3)
++        return;
++    opts->vr_yaw = MPMIN(MPMAX(y, -360.0f), 360.0f);
++    opts->vr_pitch = MPMIN(MPMAX(p, -90.0f), 90.0f);
++    opts->vr_fov = MPMIN(MPMAX(f, 10.0f), 180.0f);
++}
++
++// Returns true if the only differences between the two option sets are the
++// "hot" VR *view* fields (layout/projection/eye/stereo-output/fov/yaw/pitch/
++// head-tracking/reset-view). Those are consumed per-frame by vr.c (mesh
++// rebuilds / tracker start-stop included), so a change confined to them must
++// NOT go through reinit_from_options(): head tracking and drag-look update
++// yaw/pitch many times per second, and tearing down the render chain for
++// each update is both slow and visible (this was the fatal flaw of the old
++// user-shader approach, see PiliPlus docs/piliplayer.md §9.1).
++//
++// The VR master flag (`vr`) is deliberately NOT hot: toggling it changes
++// dumb-mode eligibility (see VR_DUMB_FIX in check_dumb_mode), so it must go
++// through a full reinit to (un)enter dumb mode and to restore/whitelist
++// p->opts accordingly.
++static bool only_vr_view_opts_changed(const struct gl_video_opts *a,
++                                      const struct gl_video_opts *b)
++{
++    if (a->vr != b->vr)
++        return false;
++    struct gl_video_opts x = *a, y = *b;
++    x.vr_view = y.vr_view; // pointer owned by the cache; content is re-parsed
++    x.vr_layout = y.vr_layout;
++    x.vr_projection = y.vr_projection;
++    x.vr_eye = y.vr_eye;
++    x.vr_stereo_output = y.vr_stereo_output;
++    x.vr_fov = y.vr_fov;
++    x.vr_yaw = y.vr_yaw;
++    x.vr_pitch = y.vr_pitch;
++    x.vr_head_tracking = y.vr_head_tracking;
++    x.vr_reset_view = y.vr_reset_view;
++    // Padding bytes could theoretically differ and force the slow path; that
++    // is harmless (identical to today's behavior).
++    return memcmp(&x, &y, sizeof(x)) == 0;
++}
++
++// Copy just the VR fields of the option struct (hot update). Assigning the
++// whole struct instead would undo the adjustments check_gl_features() made to
++// p->opts (dumb-mode whitelist, compute-peak fallback, ...).
++static void copy_vr_opts(struct gl_video_opts *dst,
++                         const struct gl_video_opts *src)
++{
++    dst->vr = src->vr;
++    dst->vr_view = src->vr_view;
++    dst->vr_layout = src->vr_layout;
++    dst->vr_projection = src->vr_projection;
++    dst->vr_eye = src->vr_eye;
++    dst->vr_stereo_output = src->vr_stereo_output;
++    dst->vr_fov = src->vr_fov;
++    dst->vr_yaw = src->vr_yaw;
++    dst->vr_pitch = src->vr_pitch;
++    dst->vr_head_tracking = src->vr_head_tracking;
++    dst->vr_reset_view = src->vr_reset_view;
++}
++
+ static void gl_video_update_options(struct gl_video *p)
+ {
+     if (m_config_cache_update(p->opts_cache)) {
+-        gl_lcms_update_options(p->cms);
+-        reinit_from_options(p);
++        struct gl_video_opts *new_opts = p->opts_cache->opts;
++        // Compare against the last-seen *cache* contents, not against p->opts
++        // (which check_gl_features may have mutated): otherwise every VR view
++        // tweak would look like a general option change and rebuild the whole
++        // render chain each time.
++        if (only_vr_view_opts_changed(&p->opts_cache_copy, new_opts)) {
++            copy_vr_opts(&p->opts, new_opts);
++            vr_parse_view_string(&p->opts);
++            // This path only runs when VR view fields changed (drag/zoom/
++            // gyro/reset/...): the cached output frame shows the old view.
++            p->output_tex_valid = false;
++        } else {
++            gl_lcms_update_options(p->cms);
++            reinit_from_options(p);
++        }
++        p->opts_cache_copy = *new_opts;
++        vr_sync_opts(p->vr, &p->opts);
+     }
+ 
+     if (mp_csp_equalizer_state_changed(p->video_eq))
+@@ -4218,6 +4409,7 @@ static void reinit_from_options(struct gl_video *p)
+     // This works only for the fields themselves of course, not for any memory
+     // referenced by them.
+     p->opts = *(struct gl_video_opts *)p->opts_cache->opts;
++    vr_parse_view_string(&p->opts);
+ 
+     if (!p->force_clear_color)
+         p->clear_color = p->opts.background_color;
+diff --git a/video/out/gpu/video.h b/video/out/gpu/video.h
+index f8e05b1..fcff2cc 100644
+--- a/video/out/gpu/video.h
++++ b/video/out/gpu/video.h
+@@ -178,6 +178,39 @@ struct gl_video_opts {
+     int early_flush;
+     char *shader_cache_dir;
+     char *hwdec_interop;
++    // VR / panoramic rendering (PiliPlus, see gpu/vr.c). All of these are
++    // plain values (no allocations - vr_view points into the option cache
++    // like every other OPT_STRING and is equalized by pointer in the
++    // hot-change comparison), which gl_video_update_options() relies on:
++    // changes confined to these fields are applied per-frame without
++    // rebuilding the render chain (except vr_projection/vr_layout, which
++    // vr.c re-meshes on its own).
++    bool vr;
++    int vr_layout;          // VR_LAYOUT_*: source stereo layout
++    int vr_projection;      // VR_PROJ_*: horizontal coverage
++    int vr_eye;             // 0 = left, 1 = right (single-screen output)
++    bool vr_stereo_output;  // Cardboard side-by-side output
++    float vr_fov;           // horizontal FOV in degrees (mono output)
++    float vr_yaw;           // manual yaw offset, degrees
++    float vr_pitch;         // manual pitch offset, degrees
++    bool vr_head_tracking;  // NDK sensor + OrientationEKF head tracking
++    int vr_reset_view;      // increment to recenter the head pose reference
++    // Packed view update "yaw=<f>,pitch=<f>,fov=<f>": lets a client change
++    // all continuous view parameters with ONE property set (each set costs a
++    // synchronous client->core->VO round trip; per-field sets made drag-look
++    // stutter). Parsed over the scalar fields whenever non-empty.
++    char *vr_view;
++};
++
++enum {
++    VR_LAYOUT_MONO = 0,
++    VR_LAYOUT_SBS = 1,
++    VR_LAYOUT_TB = 2,
++};
++
++enum {
++    VR_PROJ_360 = 0,
++    VR_PROJ_180 = 1,
+ };
+ 
+ extern const struct m_sub_options gl_video_conf;
+@@ -225,6 +258,13 @@ bool gl_video_gamma_auto_enabled(struct gl_video *p);
+ void gl_video_reset(struct gl_video *p);
+ bool gl_video_showing_interpolated_frame(struct gl_video *p);
+ 
++// VR head tracking needs continuous redraws (PiliPlus, see gpu/vr.c)
++bool gl_video_vr_needs_redraw(struct gl_video *p);
++
++// Effective VR view angles (yaw/pitch in degrees) of the last rendered
++// frame - head pose and folded bias included (PiliPlus HUD readout).
++bool gl_video_vr_view_angles(struct gl_video *p, double *yaw, double *pitch);
++
+ struct mp_hwdec_devices;
+ void gl_video_init_hwdecs(struct gl_video *p, struct ra_ctx *ra_ctx,
+                           struct mp_hwdec_devices *devs,
+diff --git a/video/out/gpu/vr.c b/video/out/gpu/vr.c
+new file mode 100644
+index 0000000..25b3faa
+--- /dev/null
++++ b/video/out/gpu/vr.c
+@@ -0,0 +1,1004 @@
++/*
++ * VR / panoramic video reprojection for vo=gpu (PiliPlus).
++ * See vr.h for the design notes and xl_player provenance.
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <math.h>
++#include <stddef.h>
++#include <string.h>
++
++#include "vr.h"
++#include "vr_tracker.h"
++
++#include "common/common.h"
++#include "common/msg.h"
++#include "mpv_talloc.h"
++#include "context.h"
++#include "ra.h"
++#include "shader_cache.h"
++#include "utils.h"
++#include "video.h"
++
++#define GLSL(x) gl_sc_add(sc, #x "\n");
++#define GLSLF(...) gl_sc_addf(sc, __VA_ARGS__)
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++#define VR_DEG2RAD (M_PI / 180.0)
++
++// Vertex formats for the shader-cache dispatches. `pos` holds pixel-space
++// coordinates (transformed through gl_transform_ortho_fbo before dispatch),
++// matching the render_pass_quad convention in video.c.
++struct vr_vert {
++    float pos[2];
++    float uv[2];
++};
++
++struct vr_dist_vert {
++    float pos[2];
++    float uv_r[2];
++    float uv_g[2];
++    float uv_b[2];
++    float vig;
++};
++
++// Sphere mesh vertex (unit sphere position + normalized source uv),
++// stored as an expanded triangle list.
++struct vr_sphere_vert {
++    float xyz[3];
++    float uv[2];
++};
++
++struct vr_ctx {
++    struct mp_log *log;
++
++    // Sphere mesh; rebuilt when the coverage (projection) changes.
++    int ball_projection;        // VR_PROJ_* the mesh was built for, or -1
++    struct vr_sphere_vert *ball;
++    int num_ball;
++
++    // Cardboard distortion meshes (static, NDC positions); [0]=left [1]=right
++    struct vr_dist_vert *dist[2];
++    int num_dist;
++
++    // Head tracker
++    struct vr_tracker *tracker;
++    bool tracker_failed;
++
++    // "Recenter" reference pose (rotation matrix inverse), sampled on
++    // vr-reset-view counter changes; same scheme as the previous PiliPlus
++    // native player (docs/piliplayer.md 14.4).
++    int last_reset_count;
++    bool want_reset;
++    bool has_ref;
++    float ref_inv[16];
++
++    // VR_GYRO_CONT (PiliPlus round 14): gyro on/off must not jump the view.
++    //  - enabling: ref is sampled (once real sensor data arrives) such that
++    //    the head-tracked model *exactly* continues the current manual view;
++    //  - disabling: the last tracked model is decomposed into yaw/pitch and
++    //    folded into bias_yaw/bias_pitch, which are added to the manual
++    //    offsets (clamped as a whole, so 180 deg sources stay bounded).
++    // Both are cleared by vr-reset-view ("recenter").
++    float bias_yaw, bias_pitch;
++    float last_model[16];   // last model rendered while tracking
++    bool have_last_tracked;
++    bool was_vr;            // previous opts->vr (rising-edge detection)
++
++    // Effective view center of the last rendered frame (decomposed to
++    // yaw/pitch degrees), exposed as the vr-view-yaw/vr-view-pitch
++    // properties so the HUD shows the *real* look direction - manual
++    // offsets, folded bias and head pose combined.
++    double view_yaw, view_pitch;
++    bool view_valid;
++
++    // Stereo intermediate texture
++    struct ra_tex *stereo_tex;
++
++    // Per-frame scratch vertex buffers
++    struct vr_vert *scratch;
++    int scratch_alloc;
++    struct vr_dist_vert *dist_scratch;
++    int dist_scratch_alloc;
++};
++
++// ---------------------------------------------------------------------------
++// mat4 helpers - line-by-line port of xl_mat4.c (column-major, GL convention)
++// ---------------------------------------------------------------------------
++
++static void vr_identity(float *out)
++{
++    static const float ident[16] = {
++        1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1,
++    };
++    memcpy(out, ident, sizeof(ident));
++}
++
++static void vr_perspective(float fovy, float aspect, float znear, float zfar,
++                           float *out)
++{
++    float f = (float)(1.0 / tan(fovy * M_PI / 360.0)), nf = 1 / (znear - zfar);
++    out[0] = f / aspect;
++    out[1] = 0;
++    out[2] = 0;
++    out[3] = 0;
++    out[4] = 0;
++    out[5] = f;
++    out[6] = 0;
++    out[7] = 0;
++    out[8] = 0;
++    out[9] = 0;
++    out[10] = (zfar + znear) * nf;
++    out[11] = -1;
++    out[12] = 0;
++    out[13] = 0;
++    out[14] = (2 * zfar * znear) * nf;
++    out[15] = 0;
++}
++
++static void vr_lookat(float eyex, float eyey, float eyez,
++                      float centerx, float centery, float centerz,
++                      float upx, float upy, float upz, float *out)
++{
++    float x0, x1, x2, y0, y1, y2, z0, z1, z2, len;
++    if (fabsf(eyex - centerx) < 0.000001f &&
++        fabsf(eyey - centery) < 0.000001f &&
++        fabsf(eyez - centerz) < 0.000001f)
++    {
++        vr_identity(out);
++        return;
++    }
++
++    z0 = eyex - centerx;
++    z1 = eyey - centery;
++    z2 = eyez - centerz;
++
++    len = 1 / sqrtf(z0 * z0 + z1 * z1 + z2 * z2);
++    z0 *= len;
++    z1 *= len;
++    z2 *= len;
++
++    x0 = upy * z2 - upz * z1;
++    x1 = upz * z0 - upx * z2;
++    x2 = upx * z1 - upy * z0;
++    len = sqrtf(x0 * x0 + x1 * x1 + x2 * x2);
++    if (!len) {
++        x0 = 0;
++        x1 = 0;
++        x2 = 0;
++    } else {
++        len = 1 / len;
++        x0 *= len;
++        x1 *= len;
++        x2 *= len;
++    }
++
++    y0 = z1 * x2 - z2 * x1;
++    y1 = z2 * x0 - z0 * x2;
++    y2 = z0 * x1 - z1 * x0;
++
++    len = sqrtf(y0 * y0 + y1 * y1 + y2 * y2);
++    if (!len) {
++        y0 = 0;
++        y1 = 0;
++        y2 = 0;
++    } else {
++        len = 1 / len;
++        y0 *= len;
++        y1 *= len;
++        y2 *= len;
++    }
++
++    out[0] = x0;
++    out[1] = y0;
++    out[2] = z0;
++    out[3] = 0;
++    out[4] = x1;
++    out[5] = y1;
++    out[6] = z1;
++    out[7] = 0;
++    out[8] = x2;
++    out[9] = y2;
++    out[10] = z2;
++    out[11] = 0;
++    out[12] = -(x0 * eyex + x1 * eyey + x2 * eyez);
++    out[13] = -(y0 * eyex + y1 * eyey + y2 * eyez);
++    out[14] = -(z0 * eyex + z1 * eyey + z2 * eyez);
++    out[15] = 1;
++}
++
++// out = out * Rx(rad) (gl-matrix semantics, same as upstream rotateX)
++static void vr_rotate_x(float *out, float rad)
++{
++    float s = sinf(rad), c = cosf(rad),
++          a10 = out[4], a11 = out[5], a12 = out[6], a13 = out[7],
++          a20 = out[8], a21 = out[9], a22 = out[10], a23 = out[11];
++    out[4] = a10 * c + a20 * s;
++    out[5] = a11 * c + a21 * s;
++    out[6] = a12 * c + a22 * s;
++    out[7] = a13 * c + a23 * s;
++    out[8] = a20 * c - a10 * s;
++    out[9] = a21 * c - a11 * s;
++    out[10] = a22 * c - a12 * s;
++    out[11] = a23 * c - a13 * s;
++}
++
++// out = out * Ry(rad)
++static void vr_rotate_y(float *out, float rad)
++{
++    float s = sinf(rad), c = cosf(rad),
++          a00 = out[0], a01 = out[1], a02 = out[2], a03 = out[3],
++          a20 = out[8], a21 = out[9], a22 = out[10], a23 = out[11];
++    out[0] = a00 * c - a20 * s;
++    out[1] = a01 * c - a21 * s;
++    out[2] = a02 * c - a22 * s;
++    out[3] = a03 * c - a23 * s;
++    out[8] = a00 * s + a20 * c;
++    out[9] = a01 * s + a21 * c;
++    out[10] = a02 * s + a22 * c;
++    out[11] = a03 * s + a23 * c;
++}
++
++// out = a * b
++static void vr_multiply(float *out, const float *a, const float *b)
++{
++    float tmp[16];
++    for (int c = 0; c < 4; c++) {
++        for (int r = 0; r < 4; r++) {
++            tmp[c * 4 + r] =
++                a[0 * 4 + r] * b[c * 4 + 0] +
++                a[1 * 4 + r] * b[c * 4 + 1] +
++                a[2 * 4 + r] * b[c * 4 + 2] +
++                a[3 * 4 + r] * b[c * 4 + 3];
++        }
++    }
++    memcpy(out, tmp, sizeof(tmp));
++}
++
++// out = transpose(in) for a rotation matrix (4x4, column-major, affine part
++// preserved as identity translation). The inverse of a rotation is its
++// transpose.
++static void vr_rot_transpose(const float *in, float *out)
++{
++    for (int r = 0; r < 4; r++) {
++        for (int c = 0; c < 4; c++) {
++            out[c * 4 + r] =
++                (r == 3 || c == 3) ? (r == c ? 1.0f : 0.0f) : in[r * 4 + c];
++        }
++    }
++}
++
++// Center direction of the sphere for a model matrix: the world-space point
++// that lands in the middle of the screen, i.e. d with M*d = (0,0,-1).
++// For rotations d = -row2(M) = -(m[2], m[6], m[10]).
++static void vr_center_dir(const float m[16], float d[3])
++{
++    d[0] = -m[2];
++    d[1] = -m[6];
++    d[2] = -m[10];
++}
++
++// Inverse of vr_center_dir for the manual model M = rotX(pitch)*rotY(yaw):
++//   d = (cos(p)*sin(y), -sin(p), -cos(p)*cos(y))
++// (verified numerically against the rotate helpers above; roll is lost,
++// which is exactly what folding a head pose into manual offsets should do).
++static void vr_angles_from_dir(const float d[3], float *yaw_deg,
++                               float *pitch_deg)
++{
++    float d1 = MPMIN(MPMAX(d[1], -1.0f), 1.0f);
++    *pitch_deg = -(float)(asin(d1) / VR_DEG2RAD);
++    *yaw_deg = (float)(atan2(d[0], -d[2]) / VR_DEG2RAD);
++}
++
++// ---------------------------------------------------------------------------
++// Meshes
++// ---------------------------------------------------------------------------
++
++// Port of get_ball_mesh() (xl_mesh_factory.c, PiliPlus parameterized
++// version), with two differences:
++//  - uv v runs 0 at the NORTH pole (mpv textures have row 0 = image top,
++//    the OES path upstream had its own transform matrix instead);
++//  - uv is normalized to [0,1] here; the per-eye source rect is applied
++//    per frame, so layout/eye switches don't rebuild the mesh.
++static void build_ball(struct vr_ctx *vr, int projection)
++{
++    talloc_free(vr->ball);
++    vr->ball = NULL;
++    vr->num_ball = 0;
++
++    float coverage = projection == VR_PROJ_180 ? 180.0f : 360.0f;
++    int step = 5;
++    int lat_steps = 180 / step;
++    int lon_steps = (int)(coverage / step);
++    if (lon_steps < 1)
++        lon_steps = 1;
++    float lon_start = 270.0f - coverage * 0.5f;
++
++    vr->num_ball = lat_steps * lon_steps * 6;
++    vr->ball = talloc_array(vr, struct vr_sphere_vert, vr->num_ball);
++
++    int k = 0;
++    for (int jj = 0; jj < lat_steps; jj++) {
++        int j0 = -90 + jj * step;
++        int j1 = j0 + step;
++        for (int i = 0; i < lon_steps; i++) {
++            struct vr_sphere_vert q[4];
++            const int corners[4][2] = {{i, j0}, {i + 1, j0},
++                                       {i + 1, j1}, {i, j1}};
++            for (int c = 0; c < 4; c++) {
++                float lon = lon_start + corners[c][0] * (float)step;
++                float lat = corners[c][1];
++                float lonr = lon / 180.0f * (float)M_PI;
++                float latr = lat / 180.0f * (float)M_PI;
++                q[c].xyz[0] = cosf(latr) * cosf(lonr);
++                q[c].xyz[1] = sinf(latr);
++                q[c].xyz[2] = cosf(latr) * sinf(lonr);
++                q[c].uv[0] = (float)corners[c][0] / lon_steps;
++                q[c].uv[1] = 0.5f - lat / 180.0f;
++            }
++            // upstream triangle order: (a,b,c), (a,c,d)
++            vr->ball[k++] = q[0];
++            vr->ball[k++] = q[1];
++            vr->ball[k++] = q[2];
++            vr->ball[k++] = q[0];
++            vr->ball[k++] = q[2];
++            vr->ball[k++] = q[3];
++        }
++    }
++    vr->ball_projection = projection;
++}
++
++static inline float dist_clamp(float val, float min, float max)
++{
++    float temp = val > min ? val : min;
++    return temp < max ? temp : max;
++}
++
++static inline float distortion_factor(float radius)
++{
++    // Cardboard lens coefficients, identical to upstream get_distortion_mesh
++    static const float coefficients[2] = {0.441000015f, 0.156000003f};
++    float result = 1.0f;
++    float rFactor = 1.0f;
++    float squaredRadius = radius * radius;
++    for (int i = 0; i < 2; i++) {
++        rFactor *= squaredRadius;
++        result += coefficients[i] * rFactor;
++    }
++    return result;
++}
++
++static inline float distort(float radius)
++{
++    return radius * distortion_factor(radius);
++}
++
++static inline float blue_distort_inverse(float radius)
++{
++    float r0 = radius / 0.9f;
++    float r = radius * 0.9f;
++    float dr0 = radius - distort(r0);
++    while (fabsf(r - r0) > 0.0001f) {
++        float dr = radius - distort(r);
++        float r2 = r - dr * ((r - r0) / (dr - dr0));
++        r0 = r;
++        r = r2;
++        dr0 = dr;
++    }
++    return r;
++}
++
++// Port of get_distortion_mesh(eye) (xl_mesh_factory.c) - Cardboard distortion
++// mesh with per-channel (chromatic aberration) uvs and vignette. Differences:
++//  - expanded to a triangle list (mpv's RA has no indexed draws);
++//  - uv v is flipped (v' = 1 - v): our stereo intermediate stores the north
++//    pole in texture row 0 (mpv FBO convention), upstream's GL-rendered eye
++//    FBO stored it in the last row.
++static void build_distortion(struct vr_ctx *vr)
++{
++    const int rows = 40;
++    const int cols = 40;
++    const float vignetteSizeTanAngle = 0.05f;
++
++    for (int eye = 0; eye < 2; eye++) {
++        float xEyeOffsetScreen = 0.523064613f;
++        float yEyeOffsetScreen = 0.80952388f;
++
++        float viewportWidthTexture = 1.43138313f;
++        float viewportHeightTexture = 1.51814604f;
++
++        float viewportXTexture = 0;
++        float viewportYTexture = 0;
++
++        float textureWidth = 2.86276627f;
++        float textureHeight = 1.51814604f;
++
++        float xEyeOffsetTexture = 0.592283607f;
++        float yEyeOffsetTexture = 0.839099586f;
++
++        float screenWidth = 2.47470069f;
++        float screenHeight = 1.39132345f;
++
++        if (eye == 1) {
++            xEyeOffsetScreen = 1.95163608f;
++            viewportXTexture = 1.43138313f;
++            xEyeOffsetTexture = 2.27048278f;
++        }
++
++        // grid vertices in upstream's 9-float interleaved layout
++        float *grid = talloc_array(vr, float, rows * cols * 9);
++        unsigned int vertexOffset = 0;
++        for (int row = 0; row < rows; row++) {
++            for (int col = 0; col < cols; col++) {
++                const float uTextureBlue = col / 39.0f *
++                    (viewportWidthTexture / textureWidth) +
++                    viewportXTexture / textureWidth;
++                const float vTextureBlue = row / 39.0f *
++                    (viewportHeightTexture / textureHeight) +
++                    viewportYTexture / textureHeight;
++
++                const float xTexture = uTextureBlue * textureWidth -
++                                       xEyeOffsetTexture;
++                const float yTexture = vTextureBlue * textureHeight -
++                                       yEyeOffsetTexture;
++                const float rTexture = sqrtf(xTexture * xTexture +
++                                             yTexture * yTexture);
++
++                const float textureToScreenBlue = (rTexture > 0.0f)
++                    ? blue_distort_inverse(rTexture) / rTexture : 1.0f;
++
++                const float xScreen = xTexture * textureToScreenBlue;
++                const float yScreen = yTexture * textureToScreenBlue;
++
++                const float uScreen = (xScreen + xEyeOffsetScreen) / screenWidth;
++                const float vScreen = (yScreen + yEyeOffsetScreen) / screenHeight;
++                const float rScreen = rTexture * textureToScreenBlue;
++
++                const float screenToTextureGreen = (rScreen > 0.0f)
++                    ? distortion_factor(rScreen) : 1.0f;
++                const float uTextureGreen =
++                    (xScreen * screenToTextureGreen + xEyeOffsetTexture) /
++                    textureWidth;
++                const float vTextureGreen =
++                    (yScreen * screenToTextureGreen + yEyeOffsetTexture) /
++                    textureHeight;
++
++                const float screenToTextureRed = (rScreen > 0.0f)
++                    ? distortion_factor(rScreen) : 1.0f;
++                const float uTextureRed =
++                    (xScreen * screenToTextureRed + xEyeOffsetTexture) /
++                    textureWidth;
++                const float vTextureRed =
++                    (yScreen * screenToTextureRed + yEyeOffsetTexture) /
++                    textureHeight;
++
++                const float vignetteSizeTexture =
++                    vignetteSizeTanAngle / textureToScreenBlue;
++
++                const float dxTexture = xTexture + xEyeOffsetTexture -
++                    dist_clamp(xTexture + xEyeOffsetTexture,
++                               viewportXTexture + vignetteSizeTexture,
++                               viewportXTexture + viewportWidthTexture -
++                                   vignetteSizeTexture);
++                const float dyTexture = yTexture + yEyeOffsetTexture -
++                    dist_clamp(yTexture + yEyeOffsetTexture,
++                               viewportYTexture + vignetteSizeTexture,
++                               viewportYTexture + viewportHeightTexture -
++                                   vignetteSizeTexture);
++                const float drTexture =
++                    sqrtf(dxTexture * dxTexture + dyTexture * dyTexture);
++
++                float vignette = 1.0f -
++                    dist_clamp(drTexture / vignetteSizeTexture, 0.0f, 1.0f);
++
++                grid[vertexOffset * 9 + 0] = 2.0f * uScreen - 1.0f;
++                grid[vertexOffset * 9 + 1] = 2.0f * vScreen - 1.0f;
++                grid[vertexOffset * 9 + 2] = vignette;
++                grid[vertexOffset * 9 + 3] = uTextureRed;
++                grid[vertexOffset * 9 + 4] = vTextureRed;
++                grid[vertexOffset * 9 + 5] = uTextureGreen;
++                grid[vertexOffset * 9 + 6] = vTextureGreen;
++                grid[vertexOffset * 9 + 7] = uTextureBlue;
++                grid[vertexOffset * 9 + 8] = vTextureBlue;
++
++                vertexOffset++;
++            }
++        }
++
++        int index_count = (rows - 1) * (cols - 1) * 6;
++        unsigned int *indices = talloc_array(vr, unsigned int, index_count);
++        int ic = 0;
++        // upstream index generation, kept as-is (rows == cols, cull disabled)
++        for (int i = 0; i < rows - 1; ++i) {
++            for (int j = 0; j < cols - 1; ++j) {
++                indices[ic++] = j * cols + i;
++                indices[ic++] = (j + 1) * cols + i;
++                indices[ic++] = (j + 1) * cols + i + 1;
++                indices[ic++] = j * cols + i;
++                indices[ic++] = (j + 1) * cols + i + 1;
++                indices[ic++] = j * cols + i + 1;
++            }
++        }
++
++        talloc_free(vr->dist[eye]);
++        vr->num_dist = index_count;
++        vr->dist[eye] = talloc_array(vr, struct vr_dist_vert, index_count);
++        for (int n = 0; n < index_count; n++) {
++            const float *g = &grid[indices[n] * 9];
++            struct vr_dist_vert *v = &vr->dist[eye][n];
++            v->pos[0] = g[0];
++            v->pos[1] = g[1];
++            v->uv_r[0] = g[3];
++            v->uv_r[1] = 1.0f - g[4];
++            v->uv_g[0] = g[5];
++            v->uv_g[1] = 1.0f - g[6];
++            v->uv_b[0] = g[7];
++            v->uv_b[1] = 1.0f - g[8];
++            v->vig = g[2];
++        }
++        talloc_free(indices);
++        talloc_free(grid);
++    }
++}
++
++// ---------------------------------------------------------------------------
++// Per-frame helpers
++// ---------------------------------------------------------------------------
++
++// Source (equirect map) uv rect for one eye. Mirrors VrShader.eyeRect on the
++// Dart side: SBS splits u, TB splits v (left eye = top half), mono = full.
++static void vr_eye_rect(const struct gl_video_opts *opts, int eye,
++                        float rect[4])
++{
++    rect[0] = 0.0f; rect[1] = 1.0f; rect[2] = 0.0f; rect[3] = 1.0f;
++    bool left = eye == 0;
++    if (opts->vr_layout == VR_LAYOUT_SBS) {
++        rect[0] = left ? 0.0f : 0.5f;
++        rect[1] = left ? 0.5f : 1.0f;
++    } else if (opts->vr_layout == VR_LAYOUT_TB) {
++        rect[2] = left ? 0.0f : 0.5f;
++        rect[3] = left ? 0.5f : 1.0f;
++    }
++}
++
++// Horizontal fov (degrees, app convention) -> vertical fov for perspective(),
++// identical to apply_fov() of the previous PiliPlus native player.
++static float vr_fovy_from_hfov(float fovh_deg, float aspect)
++{
++    float half_h = tanf(fovh_deg * 0.5f * (float)VR_DEG2RAD);
++    float fovy = 2.0f * atanf(half_h / MPMAX(aspect, 0.01f)) /
++                 (float)VR_DEG2RAD;
++    return MPMIN(MPMAX(fovy, 1.0f), 179.0f);
++}
++
++// Transform the sphere mesh with mvp into pixel-space vertices (ready for
++// gl_transform_ortho_fbo). ndc_x0..ndc_x1 selects the horizontal screen
++// region for this eye (mono: -1..1; stereo: -1..0 / 0..1). Triangles with
++// any vertex behind the camera plane are dropped - with fov limits in place
++// they can never reach the visible region, so no near-plane clipping needed.
++static int vr_transform_ball(struct vr_ctx *vr, const float mvp[16],
++                             int W, int H, const struct gl_transform *t,
++                             const float rect[4], float ndc_x0, float ndc_x1)
++{
++    MP_TARRAY_GROW(vr, vr->scratch, vr->num_ball);
++    int n = 0;
++    for (int tri = 0; tri + 2 < vr->num_ball; tri += 3) {
++        float cx[3], cy[3];
++        bool ok = true;
++        for (int vi = 0; vi < 3; vi++) {
++            const struct vr_sphere_vert *v = &vr->ball[tri + vi];
++            float x = v->xyz[0], y = v->xyz[1], z = v->xyz[2];
++            float wx = mvp[0] * x + mvp[4] * y + mvp[8] * z + mvp[12];
++            float wy = mvp[1] * x + mvp[5] * y + mvp[9] * z + mvp[13];
++            float ww = mvp[3] * x + mvp[7] * y + mvp[11] * z + mvp[15];
++            if (ww <= 1e-4f) {
++                ok = false;
++                break;
++            }
++            float nx = wx / ww, ny = wy / ww;
++            if (fabsf(nx) > 1e6f || fabsf(ny) > 1e6f) {
++                ok = false;
++                break;
++            }
++            cx[vi] = nx;
++            cy[vi] = ny;
++        }
++        if (!ok)
++            continue;
++        for (int vi = 0; vi < 3; vi++) {
++            const struct vr_sphere_vert *v = &vr->ball[tri + vi];
++            // map this eye's ndc x into its screen region, then to pixels
++            float sx = ndc_x0 + (cx[vi] * 0.5f + 0.5f) * (ndc_x1 - ndc_x0);
++            float px = (sx + 1.0f) * 0.5f * W;
++            float py = (1.0f - cy[vi]) * 0.5f * H; // y down = mpv pixel space
++            gl_transform_vec(*t, &px, &py);
++            vr->scratch[n].pos[0] = px;
++            vr->scratch[n].pos[1] = py;
++            vr->scratch[n].uv[0] = rect[0] + v->uv[0] * (rect[1] - rect[0]);
++            vr->scratch[n].uv[1] = rect[2] + v->uv[1] * (rect[3] - rect[2]);
++            n++;
++        }
++    }
++    return n;
++}
++
++static const struct ra_renderpass_input vr_vao_ball[] = {
++    {"position", RA_VARTYPE_FLOAT, 2, 1, offsetof(struct vr_vert, pos)},
++    {"vr_uv",    RA_VARTYPE_FLOAT, 2, 1, offsetof(struct vr_vert, uv)},
++};
++
++static void vr_dispatch_ball(struct gl_shader_cache *sc,
++                             struct ra_tex *src, struct ra_tex *dst,
++                             const struct vr_vert *verts, int num)
++{
++    if (num <= 0) {
++        gl_sc_reset(sc);
++        return;
++    }
++    static char name[] = "vr_flat";
++    gl_sc_uniform_texture(sc, name, src);
++    GLSL(color = texture(vr_flat, vr_uv);)
++    gl_sc_dispatch_draw(sc, dst, false, vr_vao_ball,
++                        MP_ARRAY_SIZE(vr_vao_ball), sizeof(struct vr_vert),
++                        (void *)verts, num);
++}
++
++static const struct ra_renderpass_input vr_vao_dist[] = {
++    {"position", RA_VARTYPE_FLOAT, 2, 1, offsetof(struct vr_dist_vert, pos)},
++    {"vr_uv_r",  RA_VARTYPE_FLOAT, 2, 1, offsetof(struct vr_dist_vert, uv_r)},
++    {"vr_uv_g",  RA_VARTYPE_FLOAT, 2, 1, offsetof(struct vr_dist_vert, uv_g)},
++    {"vr_uv_b",  RA_VARTYPE_FLOAT, 2, 1, offsetof(struct vr_dist_vert, uv_b)},
++    {"vr_vig",   RA_VARTYPE_FLOAT, 1, 1, offsetof(struct vr_dist_vert, vig)},
++};
++
++static void vr_dispatch_dist(struct vr_ctx *vr, struct gl_shader_cache *sc,
++                             struct ra_tex *src, struct ra_tex *dst,
++                             int eye, int W, int H,
++                             const struct gl_transform *t)
++{
++    MP_TARRAY_GROW(vr, vr->dist_scratch, vr->num_dist);
++    for (int n = 0; n < vr->num_dist; n++) {
++        const struct vr_dist_vert *in = &vr->dist[eye][n];
++        float px = (in->pos[0] + 1.0f) * 0.5f * W;
++        float py = (1.0f - in->pos[1]) * 0.5f * H;
++        gl_transform_vec(*t, &px, &py);
++        vr->dist_scratch[n] = *in;
++        vr->dist_scratch[n].pos[0] = px;
++        vr->dist_scratch[n].pos[1] = py;
++    }
++    static char name[] = "vr_stereo";
++    gl_sc_uniform_texture(sc, name, src);
++    GLSL(color.rgb = vec3(texture(vr_stereo, vr_uv_r).r,
++                          texture(vr_stereo, vr_uv_g).g,
++                          texture(vr_stereo, vr_uv_b).b) * vr_vig;)
++    gl_sc_dispatch_draw(sc, dst, false, vr_vao_dist,
++                        MP_ARRAY_SIZE(vr_vao_dist),
++                        sizeof(struct vr_dist_vert), vr->dist_scratch,
++                        vr->num_dist);
++}
++
++// Effective manual yaw/pitch (degrees) for this frame, bounded so that the
++// viewport never leaves the source coverage in manual mode (REQUIREMENTS:
++// on 180° sources manual yaw must converge at the coverage border - looking
++// past it into black is not acceptable; pitch converges at the poles of the
++// equirect map, which are its vertical border). With head tracking active
++// the pose comes from the device and is deliberately left unbounded ("gyro
++// mode may relax"), matching the Dart-side rules in vr_projection.dart.
++//
++// `aspect` is the W/H of the eye viewport actually rendered, so the vertical
++// fov (and with it the pitch bound) matches vr_perspective() exactly.
++static void vr_manual_angles(const struct vr_ctx *vr,
++                             const struct gl_video_opts *opts, float aspect,
++                             float *yaw_deg, float *pitch_deg)
++{
++    // VR_GYRO_CONT: the folded bias is part of the effective manual angle in
++    // *both* modes (while tracking it is additionally baked into ref_inv at
++    // sampling time, keeping the view continuous across toggles).
++    float yaw = opts->vr_yaw + vr->bias_yaw;
++    float pitch = opts->vr_pitch + vr->bias_pitch;
++
++    // Bounds only apply to manual look-around (incl. "tracker created but
++    // no reference sampled yet"); gyro mode is deliberately unbounded.
++    //
++    // VR_FREE_LOOK (round 16, per requirement owner): the coverage clamp for
++    // 180° sources and the pole clamp (90 - vfov/2) are GONE - dragging is
++    // unrestricted now; on 180° sources looking past the coverage simply
++    // shows black, which the owner explicitly accepts. Only sanity bounds
++    // remain: yaw wraps into [-180, 180) and pitch stays within ±90 (the
++    // equirect poles are a hard singularity, also the option M_RANGE).
++    if (!vr->tracker || !vr->has_ref) {
++        yaw = fmodf(yaw + 180.0f, 360.0f);
++        if (yaw < 0.0f)
++            yaw += 360.0f;
++        yaw -= 180.0f;
++        pitch = MPMIN(MPMAX(pitch, -90.0f), 90.0f);
++    }
++
++    *yaw_deg = yaw;
++    *pitch_deg = pitch;
++}
++
++// Model matrix composition, identical to the previous PiliPlus native player
++// (docs/piliplayer.md 14.4): tracker on => head * ref^-1 * rotY(yaw) *
++// rotX(pitch); tracker off => rotX(pitch) * rotY(yaw). yaw_deg/pitch_deg are
++// the (already bounded, see vr_manual_angles) manual offsets in degrees.
++static void vr_compute_model(struct vr_ctx *vr,
++                             const struct gl_video_opts *opts,
++                             float yaw_deg, float pitch_deg, float model[16])
++{
++    if (opts->vr_reset_view != vr->last_reset_count) {
++        vr->last_reset_count = opts->vr_reset_view;
++        vr->want_reset = true;
++        // VR_GYRO_CONT: "recenter" also clears the folded gyro residual -
++        // the current pose/orientation becomes the new zero.
++        vr->bias_yaw = vr->bias_pitch = 0.0f;
++    }
++
++    // yaw_deg/pitch_deg come from vr_manual_angles(): in manual mode (and
++    // while the tracker warms up) they already include the folded bias and
++    // the coverage clamps; when tracking with a sampled reference they are
++    // the raw option angles (the bias is baked into ref_inv, see below).
++    float yaw = yaw_deg * (float)VR_DEG2RAD;
++    float pitch = pitch_deg * (float)VR_DEG2RAD;
++
++    if (vr->tracker && vr_tracker_has_samples(vr->tracker)) {
++        float head[16];
++        vr_tracker_get_view(vr->tracker, head);
++        if (vr->want_reset || !vr->has_ref) {
++            // VR_GYRO_CONT: pick ref_inv so the tracked model continues the
++            // manual model *exactly* at this instant. yaw/pitch here are the
++            // effective manual angles (opts + folded bias, see
++            // vr_manual_angles):
++            //   M_on = head * ref_inv * A,  A = rotY(yaw) * rotX(pitch)
++            //   want   M_on == B,           B = rotX(pitch) * rotY(yaw)
++            //   =>     ref_inv = head^-1 * B * A^-1
++            // For yaw=pitch=0 this reduces to ref_inv = head^-1 (the classic
++            // "current pose is the new forward" recenter).
++            float A[16], B[16], Ai[16], headi[16], tmp[16];
++            vr_identity(A);
++            vr_rotate_y(A, yaw);
++            vr_rotate_x(A, pitch);
++            vr_identity(B);
++            vr_rotate_x(B, pitch);
++            vr_rotate_y(B, yaw);
++            vr_rot_transpose(head, headi);
++            vr_rot_transpose(A, Ai);
++            vr_multiply(tmp, headi, B);
++            vr_multiply(vr->ref_inv, tmp, Ai);
++            vr->has_ref = true;
++            vr->want_reset = false;
++        }
++        // model = head * ref_inv * rotY(yaw) * rotX(pitch)
++        float H[16];
++        vr_multiply(H, head, vr->ref_inv);
++        memcpy(model, H, sizeof(float) * 16);
++        vr_rotate_y(model, yaw);
++        vr_rotate_x(model, pitch);
++        // remember for the gyro-off fold (vr_sync_opts)
++        memcpy(vr->last_model, model, sizeof(float) * 16);
++        vr->have_last_tracked = true;
++    } else {
++        // Manual mode (or tracker still warming up): rotX(pitch)*rotY(yaw),
++        // angles already include the folded bias and the clamps.
++        vr_identity(model);
++        vr_rotate_x(model, pitch);
++        vr_rotate_y(model, yaw);
++        if (!vr->tracker) {
++            vr->has_ref = false;
++            vr->want_reset = false;
++        }
++    }
++
++    // HUD readout: decompose the rendered view center back to yaw/pitch.
++    float d[3], vy, vp;
++    vr_center_dir(model, d);
++    vr_angles_from_dir(d, &vy, &vp);
++    vr->view_yaw = vy;
++    vr->view_pitch = vp;
++    vr->view_valid = true;
++}
++
++bool vr_get_view_angles(struct vr_ctx *vr, double *yaw, double *pitch)
++{
++    if (!vr || !vr->view_valid)
++        return false;
++    *yaw = vr->view_yaw;
++    *pitch = vr->view_pitch;
++    return true;
++}
++
++// ---------------------------------------------------------------------------
++// Public API
++// ---------------------------------------------------------------------------
++
++struct vr_ctx *vr_create(void *ta_parent, struct mp_log *log)
++{
++    struct vr_ctx *vr = talloc_zero(ta_parent, struct vr_ctx);
++    vr->log = mp_log_new(vr, log, "vr");
++    vr->ball_projection = -1;
++    return vr;
++}
++
++void vr_destroy(struct vr_ctx **vr_ptr, struct ra *ra)
++{
++    struct vr_ctx *vr = vr_ptr ? *vr_ptr : NULL;
++    if (!vr)
++        return;
++    if (vr->tracker) {
++        vr_tracker_destroy(vr->tracker);
++        vr->tracker = NULL;
++    }
++    if (ra)
++        ra_tex_free(ra, &vr->stereo_tex);
++    talloc_free(vr);
++    if (vr_ptr)
++        *vr_ptr = NULL;
++}
++
++void vr_new_stream(struct vr_ctx *vr)
++{
++    if (!vr)
++        return;
++    // VR_GYRO_CONT: the folded bias belongs to one stream's manual zero
++    // point; the client re-zeroes its view offsets for every new file, so
++    // the bias must not survive playlist advances. The head reference does
++    // survive on purpose - gyro viewing continues smoothly across items.
++    vr->bias_yaw = vr->bias_pitch = 0.0f;
++    vr->have_last_tracked = false;
++}
++
++void vr_sync_opts(struct vr_ctx *vr, const struct gl_video_opts *opts)
++{
++    if (!vr)
++        return;
++
++    if (opts->vr && !vr->was_vr) {
++        // VR_GYRO_CONT: a fresh VR session restarts the manual zero point -
++        // the client resets its view offsets whenever VR is (re-)enabled, so
++        // a folded bias from the previous session must not leak over.
++        vr->bias_yaw = vr->bias_pitch = 0.0f;
++        vr->have_last_tracked = false;
++    }
++    vr->was_vr = opts->vr;
++
++    bool want_tracking = opts->vr && opts->vr_head_tracking;
++    if (want_tracking && !vr->tracker && !vr->tracker_failed) {
++        vr->tracker = vr_tracker_create(vr->log);
++        if (!vr->tracker) {
++            vr->tracker_failed = true;
++            MP_WARN(vr, "head tracking unavailable on this device\n");
++        }
++        // VR_GYRO_CONT: sample the reference on the first frame that has
++        // real sensor data, so enabling gyro continues the current view
++        // instead of snapping to the raw device orientation (which also
++        // caused the "starts out facing backwards" complaint).
++        vr->has_ref = false;
++        vr->want_reset = true;
++        vr->have_last_tracked = false;
++    }
++    if (!want_tracking && vr->tracker) {
++        // VR_GYRO_CONT: fold the last tracked orientation into the manual
++        // bias so disabling gyro does not jump the view. Roll is dropped
++        // (manual mode has no roll), the view center is preserved exactly.
++        if (vr->have_last_tracked) {
++            float d[3], Y, P;
++            vr_center_dir(vr->last_model, d);
++            vr_angles_from_dir(d, &Y, &P);
++            // new totals: opts + bias == Y/P exactly (the off-mode clamps
++            // may pull them back inside the coverage bounds afterwards)
++            vr->bias_yaw = Y - opts->vr_yaw;
++            vr->bias_pitch = P - opts->vr_pitch;
++            // keep the bias bounded; a full turn is the same orientation
++            vr->bias_yaw = fmodf(vr->bias_yaw + 180.0f, 360.0f);
++            if (vr->bias_yaw < 0.0f)
++                vr->bias_yaw += 360.0f;
++            vr->bias_yaw -= 180.0f;
++            vr->bias_pitch = MPMIN(MPMAX(vr->bias_pitch, -90.0f), 90.0f);
++        }
++        vr_tracker_destroy(vr->tracker);
++        vr->tracker = NULL;
++        vr->has_ref = false;
++        vr->want_reset = false;
++        vr->have_last_tracked = false;
++    }
++    if (!want_tracking)
++        vr->tracker_failed = false;
++
++    if (opts->vr && vr->ball_projection != opts->vr_projection)
++        build_ball(vr, opts->vr_projection);
++    if (opts->vr && !vr->dist[0])
++        build_distortion(vr);
++}
++
++void vr_draw(struct vr_ctx *vr, struct gl_shader_cache *sc, struct ra *ra,
++             struct ra_tex *flat_tex, const struct ra_fbo *target,
++             const struct gl_video_opts *opts)
++{
++    if (!vr || !flat_tex || !target || !target->tex)
++        return;
++
++    vr_sync_opts(vr, opts);
++    if (!vr->ball || vr->num_ball <= 0)
++        return;
++
++    int W = target->tex->params.w;
++    int H = target->tex->params.h;
++    if (W <= 0 || H <= 0)
++        return;
++
++    struct gl_transform t;
++    gl_transform_ortho_fbo(&t, target);
++
++    if (!opts->vr_stereo_output) {
++        float aspect = (float)W / (float)H;
++        float yaw, pitch, model[16];
++        vr_manual_angles(vr, opts, aspect, &yaw, &pitch);
++        vr_compute_model(vr, opts, yaw, pitch, model);
++        float proj[16], view[16], mv[16], mvp[16];
++        vr_perspective(vr_fovy_from_hfov(opts->vr_fov, aspect), aspect,
++                       0.01f, 10.0f, proj);
++        vr_lookat(0, 0, 0, 0, 0, -1.0f, 0, 1, 0, view);
++        vr_multiply(mv, proj, view);
++        vr_multiply(mvp, mv, model);
++
++        float rect[4];
++        vr_eye_rect(opts, opts->vr_eye, rect);
++        int n = vr_transform_ball(vr, mvp, W, H, &t, rect, -1.0f, 1.0f);
++        vr_dispatch_ball(sc, flat_tex, target->tex, vr->scratch, n);
++        return;
++    }
++
++    // Cardboard stereo: render both eye views into an intermediate texture
++    // (left eye -> left half), then apply the lens distortion meshes, exactly
++    // like upstream xl_model_vr's two-stage draw().
++    if (!ra_tex_resize(ra, vr->log, &vr->stereo_tex, W, H,
++                       flat_tex->params.format))
++    {
++        MP_WARN(vr, "could not allocate stereo intermediate texture\n");
++        return;
++    }
++    ra->fns->clear(ra, vr->stereo_tex, (float[4]){0.0f, 0.0f, 0.0f, 1.0f},
++                   NULL);
++
++    struct ra_fbo ifbo = { .tex = vr->stereo_tex };
++    struct gl_transform ti;
++    gl_transform_ortho_fbo(&ti, &ifbo);
++
++    float aspect = (float)W / (float)H / 2.0f;
++    float yaw, pitch, model[16];
++    // Same manual bounds as the mono path (per-eye aspect); Cardboard output
++    // is a bonus mode and not part of the REQUIREMENTS matrix, but keeping the
++    // rules identical avoids surprises.
++    vr_manual_angles(vr, opts, aspect, &yaw, &pitch);
++    vr_compute_model(vr, opts, yaw, pitch, model);
++    float proj[16];
++    vr_perspective(60.0f, aspect, 0.01f, 100.0f, proj);
++
++    for (int eye = 0; eye < 2; eye++) {
++        float ex = eye == 0 ? -0.012f : 0.012f;
++        float view[16], mv[16], mvp[16];
++        vr_lookat(ex, 0, 0, 0, 0, -1.0f, 0, 1, 0, view);
++        vr_multiply(mv, proj, view);
++        vr_multiply(mvp, mv, model);
++
++        float rect[4];
++        vr_eye_rect(opts, eye, rect);
++        float x0 = eye == 0 ? -1.0f : 0.0f;
++        float x1 = eye == 0 ? 0.0f : 1.0f;
++        int n = vr_transform_ball(vr, mvp, W, H, &ti, rect, x0, x1);
++        vr_dispatch_ball(sc, flat_tex, vr->stereo_tex, vr->scratch, n);
++    }
++
++    if (!vr->dist[0])
++        build_distortion(vr);
++    for (int eye = 0; eye < 2; eye++)
++        vr_dispatch_dist(vr, sc, vr->stereo_tex, target->tex, eye, W, H, &t);
++}
+diff --git a/video/out/gpu/vr.h b/video/out/gpu/vr.h
+new file mode 100644
+index 0000000..f97ef39
+--- /dev/null
++++ b/video/out/gpu/vr.h
+@@ -0,0 +1,72 @@
++/*
++ * VR / panoramic video reprojection for vo=gpu (PiliPlus).
++ *
++ * Renders the fully composited flat video frame (equirectangular source)
++ * onto a UV sphere with head tracking, replacing the final full-screen
++ * blit of the normal rendering path. Rendering approach ported from
++ * xl_player (https://github.com/xl-player-developers/xl_player):
++ *   - spherical mesh with parameterized coverage / per-eye uv ranges
++ *     (xl_mesh_factory.c get_ball_mesh + PiliPlus projection extension)
++ *   - Cardboard stereo output with lens distortion mesh (xl_model_vr.c +
++ *     get_distortion_mesh, including the chromatic aberration uv sets)
++ *   - head pose from the Cardboard OrientationEKF (vr_tracker.c)
++ *   - matrix composition order identical to the xl_player ball model:
++ *     MVP = perspective * lookAt * model, model = head * ref^-1 * rotY * rotX
++ *     (tracker on) or rotX * rotY (tracker off).
++ *
++ * The vertex MVP transform is done on the CPU (positions are emitted as
++ * pixel coordinates and passed through gl_transform_ortho_fbo, exactly like
++ * render_pass_quad in video.c), because the mpv shader-cache vertex stage is
++ * a fixed pass-through of `position`. Triangles with any vertex at w <= 0
++ * (behind the camera) are dropped; with fovy <= ~150 deg they can never
++ * intersect the visible frustum, so this is artifact-free and avoids CPU
++ * near-plane clipping.
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++
++struct gl_shader_cache;
++struct gl_video_opts;
++struct mp_log;
++struct ra;
++struct ra_fbo;
++struct ra_tex;
++
++struct vr_ctx;
++
++struct vr_ctx *vr_create(void *ta_parent, struct mp_log *log);
++
++// Destroy the renderer. Stops the head tracker thread and frees the stereo
++// intermediate texture (needs ra for that). Safe with NULL/*NULL.
++void vr_destroy(struct vr_ctx **vr, struct ra *ra);
++
++// Apply option changes: (re)build meshes when layout/projection changed and
++// start/stop the head tracker. Cheap; call whenever options were updated
++// (before the next vr_draw).
++void vr_sync_opts(struct vr_ctx *vr, const struct gl_video_opts *opts);
++
++// New video stream (playlist advance / reconfig): drop per-stream manual
++// residue (folded gyro bias). See VR_GYRO_CONT in vr.c.
++void vr_new_stream(struct vr_ctx *vr);
++
++// Effective view center (yaw/pitch degrees) of the last rendered frame, or
++// false if nothing has been rendered yet. Backs the vr-view-yaw/pitch
++// properties used by the client HUD.
++bool vr_get_view_angles(struct vr_ctx *vr, double *yaw, double *pitch);
++
++// Render the VR view. flat_tex is the fully composited flat frame (the
++// equirectangular map), target is the destination framebuffer. Uses the
++// shader cache for the actual passes; the cache must be in a reset state
++// (i.e. right after a finish_pass_* dispatch) and is left reset.
++void vr_draw(struct vr_ctx *vr, struct gl_shader_cache *sc, struct ra *ra,
++             struct ra_tex *flat_tex, const struct ra_fbo *target,
++             const struct gl_video_opts *opts);
+diff --git a/video/out/gpu/vr_tracker.c b/video/out/gpu/vr_tracker.c
+new file mode 100644
+index 0000000..74b08fd
+--- /dev/null
++++ b/video/out/gpu/vr_tracker.c
+@@ -0,0 +1,799 @@
++/*
++ * VR head tracker: Cardboard OrientationEKF + NDK sensor thread, ported to C
++ * from xl_player (see vr_tracker.h for provenance).
++ *
++ * The EKF math below is a mechanical translation of:
++ *   Vector3d.cpp / Matrix3x3d.cpp / SO3Util.cpp / OrientationEKF.cpp
++ * keeping the same field order, constants and operation order so that the
++ * filter behaves identically to the reference implementation.
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#include <math.h>
++#include <string.h>
++
++#include "vr_tracker.h"
++
++#include "common/common.h"
++#include "common/msg.h"
++#include "mpv_talloc.h"
++
++#ifndef M_PI
++#define M_PI 3.14159265358979323846
++#endif
++
++// ---------------------------------------------------------------------------
++// Vector3d / Matrix3x3d / SO3Util port
++// ---------------------------------------------------------------------------
++
++typedef struct {
++    double x, y, z;
++} vr_v3;
++
++static void v3_set(vr_v3 *v, double x, double y, double z)
++{
++    v->x = x; v->y = y; v->z = z;
++}
++
++static void v3_set_component(vr_v3 *v, int i, double val)
++{
++    if (i == 0) {
++        v->x = val;
++    } else if (i == 1) {
++        v->y = val;
++    } else {
++        v->z = val;
++    }
++}
++
++static void v3_zero(vr_v3 *v)
++{
++    v3_set(v, 0, 0, 0);
++}
++
++static void v3_scale(vr_v3 *v, double s)
++{
++    v->x *= s; v->y *= s; v->z *= s;
++}
++
++static double v3_length(const vr_v3 *v)
++{
++    return sqrt(v->x * v->x + v->y * v->y + v->z * v->z);
++}
++
++static void v3_normalize(vr_v3 *v)
++{
++    double d = v3_length(v);
++    if (d != 0.0)
++        v3_scale(v, 1.0 / d);
++}
++
++static double v3_dot(const vr_v3 *a, const vr_v3 *b)
++{
++    return a->x * b->x + a->y * b->y + a->z * b->z;
++}
++
++static void v3_sub(const vr_v3 *a, const vr_v3 *b, vr_v3 *result)
++{
++    v3_set(result, a->x - b->x, a->y - b->y, a->z - b->z);
++}
++
++static void v3_cross(const vr_v3 *a, const vr_v3 *b, vr_v3 *result)
++{
++    v3_set(result, a->y * b->z - a->z * b->y,
++                   a->z * b->x - a->x * b->z,
++                   a->x * b->y - a->y * b->x);
++}
++
++static int v3_largest_abs_component(const vr_v3 *v)
++{
++    double xAbs = fabs(v->x);
++    double yAbs = fabs(v->y);
++    double zAbs = fabs(v->z);
++    if (xAbs > yAbs) {
++        if (xAbs > zAbs)
++            return 0;
++        return 2;
++    }
++    if (yAbs > zAbs)
++        return 1;
++    return 2;
++}
++
++static void v3_ortho(const vr_v3 *v, vr_v3 *result)
++{
++    int k = v3_largest_abs_component(v) - 1;
++    if (k < 0)
++        k = 2;
++    v3_zero(result);
++    v3_set_component(result, k, 1.0);
++    v3_cross(v, result, result);
++    v3_normalize(result);
++}
++
++// Row-major 3x3 matrix: m[r * 3 + c] == get(r, c), same as Matrix3x3d.
++typedef struct {
++    double m[9];
++} vr_m3;
++
++static double m3_get(const vr_m3 *a, int r, int c)
++{
++    return a->m[3 * r + c];
++}
++
++static void m3_set(vr_m3 *a, int r, int c, double v)
++{
++    a->m[3 * r + c] = v;
++}
++
++static void m3_zero(vr_m3 *a)
++{
++    memset(a->m, 0, sizeof(a->m));
++}
++
++static void m3_identity(vr_m3 *a)
++{
++    m3_zero(a);
++    a->m[0] = a->m[4] = a->m[8] = 1.0;
++}
++
++static void m3_same_diagonal(vr_m3 *a, double d)
++{
++    a->m[0] = d;
++    a->m[4] = d;
++    a->m[8] = d;
++}
++
++static void m3_set_column(vr_m3 *a, int col, const vr_v3 *v)
++{
++    a->m[col] = v->x;
++    a->m[col + 3] = v->y;
++    a->m[col + 6] = v->z;
++}
++
++static void m3_plus_equals(vr_m3 *a, const vr_m3 *b)
++{
++    for (int i = 0; i < 9; i++)
++        a->m[i] += b->m[i];
++}
++
++static void m3_minus_equals(vr_m3 *a, const vr_m3 *b)
++{
++    for (int i = 0; i < 9; i++)
++        a->m[i] -= b->m[i];
++}
++
++static void m3_transpose(const vr_m3 *a, vr_m3 *result)
++{
++    vr_m3 t;
++    for (int r = 0; r < 3; r++) {
++        for (int c = 0; c < 3; c++)
++            m3_set(&t, r, c, m3_get(a, c, r));
++    }
++    *result = t;
++}
++
++static void m3_mult(const vr_m3 *a, const vr_m3 *b, vr_m3 *result)
++{
++    vr_m3 t;
++    for (int r = 0; r < 3; r++) {
++        for (int c = 0; c < 3; c++) {
++            m3_set(&t, r, c,
++                   m3_get(a, r, 0) * m3_get(b, 0, c) +
++                   m3_get(a, r, 1) * m3_get(b, 1, c) +
++                   m3_get(a, r, 2) * m3_get(b, 2, c));
++        }
++    }
++    *result = t;
++}
++
++static void m3_mult_vec(const vr_m3 *a, const vr_v3 *v, vr_v3 *result)
++{
++    v3_set(result,
++           a->m[0] * v->x + a->m[1] * v->y + a->m[2] * v->z,
++           a->m[3] * v->x + a->m[4] * v->y + a->m[5] * v->z,
++           a->m[6] * v->x + a->m[7] * v->y + a->m[8] * v->z);
++}
++
++static void m3_invert(const vr_m3 *a, vr_m3 *result)
++{
++    // Matrix3x3d::invert() returned false on singular matrices and left the
++    // result untouched; callers only ever passed covariance matrices. Keep
++    // the same formula.
++    double d = m3_get(a, 0, 0) * (m3_get(a, 1, 1) * m3_get(a, 2, 2) -
++                                  m3_get(a, 2, 1) * m3_get(a, 1, 2))
++             - m3_get(a, 0, 1) * (m3_get(a, 1, 0) * m3_get(a, 2, 2) -
++                                  m3_get(a, 1, 2) * m3_get(a, 2, 0))
++             + m3_get(a, 0, 2) * (m3_get(a, 1, 0) * m3_get(a, 2, 1) -
++                                  m3_get(a, 1, 1) * m3_get(a, 2, 0));
++    if (d == 0.0) {
++        *result = *a;
++        return;
++    }
++    double invdet = 1.0 / d;
++    vr_m3 t;
++    t.m[0] =  (a->m[4] * a->m[8] - a->m[7] * a->m[5]) * invdet;
++    t.m[1] = -(a->m[1] * a->m[8] - a->m[2] * a->m[7]) * invdet;
++    t.m[2] =  (a->m[1] * a->m[5] - a->m[2] * a->m[4]) * invdet;
++    t.m[3] = -(a->m[3] * a->m[8] - a->m[5] * a->m[6]) * invdet;
++    t.m[4] =  (a->m[0] * a->m[8] - a->m[2] * a->m[6]) * invdet;
++    t.m[5] = -(a->m[0] * a->m[5] - a->m[3] * a->m[2]) * invdet;
++    t.m[6] =  (a->m[3] * a->m[7] - a->m[6] * a->m[4]) * invdet;
++    t.m[7] = -(a->m[0] * a->m[7] - a->m[6] * a->m[1]) * invdet;
++    t.m[8] =  (a->m[0] * a->m[4] - a->m[3] * a->m[1]) * invdet;
++    *result = t;
++}
++
++static void so3_rodrigues_exp(const vr_v3 *w, double kA, double kB,
++                              vr_m3 *result)
++{
++    const double wx2 = w->x * w->x;
++    const double wy2 = w->y * w->y;
++    const double wz2 = w->z * w->z;
++    m3_set(result, 0, 0, 1.0 - kB * (wy2 + wz2));
++    m3_set(result, 1, 1, 1.0 - kB * (wx2 + wz2));
++    m3_set(result, 2, 2, 1.0 - kB * (wx2 + wy2));
++
++    double a = kA * w->z;
++    double b = kB * (w->x * w->y);
++    m3_set(result, 0, 1, b - a);
++    m3_set(result, 1, 0, b + a);
++
++    a = kA * w->y;
++    b = kB * (w->x * w->z);
++    m3_set(result, 0, 2, b + a);
++    m3_set(result, 2, 0, b - a);
++
++    a = kA * w->x;
++    b = kB * (w->y * w->z);
++    m3_set(result, 1, 2, b - a);
++    m3_set(result, 2, 1, b + a);
++}
++
++static void so3_from_mu(const vr_v3 *w, vr_m3 *result)
++{
++    const double thetaSq = v3_dot(w, w);
++    const double theta = sqrt(thetaSq);
++    double kA, kB;
++    if (thetaSq < 1.0E-08) {
++        kA = 1.0 - 0.16666667163372 * thetaSq;
++        kB = 0.5;
++    } else if (thetaSq < 1.0E-06) {
++        kB = 0.5 - 0.0416666679084301 * thetaSq;
++        kA = 1.0 - thetaSq * 0.16666667163372 *
++             (1.0 - 0.16666667163372 * thetaSq);
++    } else {
++        const double invTheta = 1.0 / theta;
++        kA = sin(theta) * invTheta;
++        kB = (1.0 - cos(theta)) * (invTheta * invTheta);
++    }
++    so3_rodrigues_exp(w, kA, kB, result);
++}
++
++static void so3_rotation_pi_about_axis(const vr_v3 *v, vr_m3 *result)
++{
++    vr_v3 tmp = *v;
++    v3_scale(&tmp, M_PI / v3_length(&tmp));
++    const double kA = 0.0;
++    const double kB = 0.20264236728467558;
++    so3_rodrigues_exp(&tmp, kA, kB, result);
++}
++
++static void so3_from_two_vec(const vr_v3 *a, const vr_v3 *b, vr_m3 *result)
++{
++    vr_v3 n;
++    v3_cross(a, b, &n);
++
++    if (v3_length(&n) == 0.0) {
++        double dot = v3_dot(a, b);
++        if (dot >= 0.0) {
++            m3_identity(result);
++        } else {
++            vr_v3 axis;
++            v3_ortho(a, &axis);
++            so3_rotation_pi_about_axis(&axis, result);
++        }
++        return;
++    }
++
++    vr_v3 na = *a;
++    vr_v3 nb = *b;
++    v3_normalize(&n);
++    v3_normalize(&na);
++    v3_normalize(&nb);
++
++    vr_v3 temp;
++    vr_m3 r1, r2;
++    m3_set_column(&r1, 0, &na);
++    m3_set_column(&r1, 1, &n);
++    v3_cross(&n, &na, &temp);
++    m3_set_column(&r1, 2, &temp);
++
++    m3_set_column(&r2, 0, &nb);
++    m3_set_column(&r2, 1, &n);
++    v3_cross(&n, &nb, &temp);
++    m3_set_column(&r2, 2, &temp);
++
++    vr_m3 r1t;
++    m3_transpose(&r1, &r1t);
++    m3_mult(&r2, &r1t, result);
++}
++
++static void so3_mu_from(const vr_m3 *so3, vr_v3 *result)
++{
++    const double cosAngle =
++        (m3_get(so3, 0, 0) + m3_get(so3, 1, 1) + m3_get(so3, 2, 2) - 1.0) * 0.5;
++    v3_set(result, (m3_get(so3, 2, 1) - m3_get(so3, 1, 2)) / 2.0,
++                   (m3_get(so3, 0, 2) - m3_get(so3, 2, 0)) / 2.0,
++                   (m3_get(so3, 1, 0) - m3_get(so3, 0, 1)) / 2.0);
++
++    double sinAngleAbs = v3_length(result);
++    if (cosAngle > 0.7071067811865476) {
++        if (sinAngleAbs > 0.0)
++            v3_scale(result, asin(sinAngleAbs) / sinAngleAbs);
++    } else if (cosAngle > -0.7071067811865476) {
++        const double angle = acos(cosAngle);
++        v3_scale(result, angle / sinAngleAbs);
++    } else {
++        double angle = M_PI - asin(sinAngleAbs);
++        double d0 = m3_get(so3, 0, 0) - cosAngle;
++        double d1 = m3_get(so3, 1, 1) - cosAngle;
++        double d2 = m3_get(so3, 2, 2) - cosAngle;
++
++        vr_v3 r2;
++        if ((d0 * d0 > d1 * d1) && (d0 * d0 > d2 * d2)) {
++            v3_set(&r2, d0,
++                   (m3_get(so3, 1, 0) + m3_get(so3, 0, 1)) / 2.0,
++                   (m3_get(so3, 0, 2) + m3_get(so3, 2, 0)) / 2.0);
++        } else if (d1 * d1 > d2 * d2) {
++            v3_set(&r2, (m3_get(so3, 1, 0) + m3_get(so3, 0, 1)) / 2.0,
++                   d1,
++                   (m3_get(so3, 2, 1) + m3_get(so3, 1, 2)) / 2.0);
++        } else {
++            v3_set(&r2, (m3_get(so3, 0, 2) + m3_get(so3, 2, 0)) / 2.0,
++                   (m3_get(so3, 2, 1) + m3_get(so3, 1, 2)) / 2.0,
++                   d2);
++        }
++
++        if (v3_dot(&r2, result) < 0.0)
++            v3_scale(&r2, -1.0);
++
++        v3_normalize(&r2);
++        v3_scale(&r2, angle);
++        *result = r2;
++    }
++}
++
++// ---------------------------------------------------------------------------
++// OrientationEKF port
++// ---------------------------------------------------------------------------
++
++struct vr_ekf {
++    vr_m3 so3_sensor_from_world;
++    vr_m3 so3_last_motion;
++    vr_m3 mP, mQ, mR, mR_acceleration, mS, mH, mK;
++    vr_v3 vNu, vZ, vH, vU, vX, vDown, vNorth;
++    double sensor_timestamp_gyro;
++    vr_v3 last_gyro;
++    bool aligned_to_gravity;
++    // Gyro timestep filter state
++    double filtered_gyro_timestep;
++    bool timestep_filter_init;
++    int num_gyro_timestep_samples;
++    bool gyro_filter_valid;
++};
++
++static void ekf_filter_gyro_timestep(struct vr_ekf *e, double timestep)
++{
++    const double kFilterCoeff = 0.95;
++    if (!e->timestep_filter_init) {
++        e->filtered_gyro_timestep = timestep;
++        e->num_gyro_timestep_samples = 1;
++        e->timestep_filter_init = true;
++    } else {
++        e->filtered_gyro_timestep =
++            kFilterCoeff * e->filtered_gyro_timestep +
++            (1.0 - kFilterCoeff) * timestep;
++        ++e->num_gyro_timestep_samples;
++        e->gyro_filter_valid = (e->num_gyro_timestep_samples > 10);
++    }
++}
++
++static void ekf_update_covariances_after_motion(struct vr_ekf *e)
++{
++    vr_m3 lastT, temp;
++    m3_transpose(&e->so3_last_motion, &lastT);
++    m3_mult(&e->mP, &lastT, &temp);
++    m3_mult(&e->so3_last_motion, &temp, &e->mP);
++    m3_identity(&e->so3_last_motion);
++}
++
++static void ekf_reset(struct vr_ekf *e)
++{
++    memset(e, 0, sizeof(*e));
++    e->gyro_filter_valid = true;
++    m3_identity(&e->so3_sensor_from_world);
++    m3_identity(&e->so3_last_motion);
++    m3_zero(&e->mP);
++    m3_same_diagonal(&e->mP, 25.0);
++    m3_zero(&e->mQ);
++    m3_same_diagonal(&e->mQ, 1.0);
++    m3_zero(&e->mR);
++    m3_same_diagonal(&e->mR, 0.0625);
++    m3_zero(&e->mR_acceleration);
++    m3_same_diagonal(&e->mR_acceleration, 0.5625);
++    m3_zero(&e->mS);
++    m3_zero(&e->mH);
++    m3_zero(&e->mK);
++    v3_set(&e->vDown, 0.0, 0.0, 9.81);
++    v3_set(&e->vNorth, 0.0, 1.0, 0.0);
++}
++
++static void ekf_accel_observation_jacobian(struct vr_ekf *e,
++                                           const vr_m3 *so3_pred,
++                                           vr_v3 *result)
++{
++    m3_mult_vec(so3_pred, &e->vDown, &e->vH);
++    vr_m3 temp;
++    so3_from_two_vec(&e->vH, &e->vZ, &temp);
++    so3_mu_from(&temp, result);
++}
++
++MP_UNUSED
++static void ekf_process_gyro(struct vr_ekf *e, vr_v3 gyro,
++                             double sensor_timestamp)
++{
++    if (e->sensor_timestamp_gyro != 0.0) {
++        double dT = (sensor_timestamp - e->sensor_timestamp_gyro) * 1.0E-09F;
++        if (dT > 0.04f) {
++            dT = e->gyro_filter_valid ? e->filtered_gyro_timestep : 0.01;
++        } else {
++            ekf_filter_gyro_timestep(e, dT);
++        }
++
++        v3_set(&e->vU, gyro.x * -dT, gyro.y * -dT, gyro.z * -dT);
++        so3_from_mu(&e->vU, &e->so3_last_motion);
++
++        vr_m3 temp;
++        m3_mult(&e->so3_last_motion, &e->so3_sensor_from_world, &temp);
++        e->so3_sensor_from_world = temp;
++
++        ekf_update_covariances_after_motion(e);
++        temp = e->mQ;
++        for (int i = 0; i < 9; i++)
++            temp.m[i] *= dT * dT;
++        m3_plus_equals(&e->mP, &temp);
++    }
++    e->sensor_timestamp_gyro = sensor_timestamp;
++    e->last_gyro = gyro;
++}
++
++MP_UNUSED
++static void ekf_process_acceleration(struct vr_ekf *e, vr_v3 acc)
++{
++    e->vZ = acc;
++    if (e->aligned_to_gravity) {
++        ekf_accel_observation_jacobian(e, &e->so3_sensor_from_world, &e->vNu);
++        const double eps = 1.0E-7;
++        for (int dof = 0; dof < 3; dof++) {
++            vr_v3 delta;
++            v3_zero(&delta);
++            v3_set_component(&delta, dof, eps);
++            vr_m3 tempM;
++            so3_from_mu(&delta, &tempM);
++            m3_mult(&tempM, &e->so3_sensor_from_world, &tempM);
++            vr_v3 tempV;
++            ekf_accel_observation_jacobian(e, &tempM, &tempV);
++            v3_sub(&e->vNu, &tempV, &tempV);
++            v3_scale(&tempV, 1.0 / eps);
++            m3_set_column(&e->mH, dof, &tempV);
++        }
++
++        vr_m3 mHt, temp, temp2;
++        m3_transpose(&e->mH, &mHt);
++        m3_mult(&e->mP, &mHt, &temp);
++        m3_mult(&e->mH, &temp, &temp);
++        vr_m3 sum = temp;
++        m3_plus_equals(&sum, &e->mR_acceleration);
++        e->mS = sum;
++        vr_m3 sInv;
++        m3_invert(&e->mS, &sInv);
++
++        m3_mult(&mHt, &sInv, &temp);
++        m3_mult(&e->mP, &temp, &e->mK);
++        m3_mult_vec(&e->mK, &e->vNu, &e->vX);
++        m3_mult(&e->mK, &e->mH, &temp);
++        m3_identity(&temp2);
++        m3_minus_equals(&temp2, &temp);
++        m3_mult(&temp2, &e->mP, &e->mP);
++        so3_from_mu(&e->vX, &e->so3_last_motion);
++        m3_mult(&e->so3_last_motion, &e->so3_sensor_from_world, &temp);
++        e->so3_sensor_from_world = temp;
++        ekf_update_covariances_after_motion(e);
++    } else {
++        so3_from_two_vec(&e->vDown, &e->vZ, &e->so3_sensor_from_world);
++        e->aligned_to_gravity = true;
++    }
++}
++
++// OrientationEKF::getPredictedGLMatrix + glMatrixFromSo3
++MP_UNUSED
++static void ekf_get_predicted_gl_matrix(struct vr_ekf *e,
++                                        double seconds_after_last_gyro,
++                                        float *matrix)
++{
++    double dT = seconds_after_last_gyro;
++    vr_v3 pmu;
++    v3_set(&pmu, e->last_gyro.x * -dT, e->last_gyro.y * -dT,
++                 e->last_gyro.z * -dT);
++    vr_m3 so3_predicted_motion, so3_predicted_state;
++    so3_from_mu(&pmu, &so3_predicted_motion);
++    m3_mult(&so3_predicted_motion, &e->so3_sensor_from_world,
++            &so3_predicted_state);
++
++    for (int r = 0; r < 3; r++) {
++        for (int c = 0; c < 3; c++)
++            matrix[4 * c + r] = m3_get(&so3_predicted_state, r, c);
++    }
++    matrix[3] = 0.0;
++    matrix[7] = 0.0;
++    matrix[11] = 0.0;
++    matrix[12] = 0.0;
++    matrix[13] = 0.0;
++    matrix[14] = 0.0;
++    matrix[15] = 1.0;
++}
++
++// ---------------------------------------------------------------------------
++// Column-major 4x4 helpers (xl_mat4 semantics: multiply(out,a,b) => a*b)
++// ---------------------------------------------------------------------------
++
++static void mat4_identity(float *out)
++{
++    static const float ident[16] = {
++        1, 0, 0, 0,  0, 1, 0, 0,  0, 0, 1, 0,  0, 0, 0, 1,
++    };
++    memcpy(out, ident, sizeof(ident));
++}
++
++#if defined(__ANDROID__)
++
++#include <android/sensor.h>
++#include <pthread.h>
++#include <stdatomic.h>
++#include <sys/prctl.h>
++#include <sys/time.h>
++#include <unistd.h>
++
++MP_UNUSED
++static void mat4_multiply(float *out, const float *a, const float *b)
++{
++    float tmp[16];
++    for (int c = 0; c < 4; c++) {
++        for (int r = 0; r < 4; r++) {
++            tmp[c * 4 + r] =
++                a[0 * 4 + r] * b[c * 4 + 0] +
++                a[1 * 4 + r] * b[c * 4 + 1] +
++                a[2 * 4 + r] * b[c * 4 + 2] +
++                a[3 * 4 + r] * b[c * 4 + 3];
++        }
++    }
++    memcpy(out, tmp, sizeof(tmp));
++}
++
++// Landscape correction matrix from upstream xl_tracker.c
++// (Matrix.setRotateEulerM(mEkfToHeadTracker, 0, -90.0F, 0.0F, 0.0F)).
++static const float ekf_to_head_tracker[16] = {
++    -1.0f, 0.0f, 0.0f, 0.0f,
++    0.0f, -4.371139E-8f, 1.0f, 0.0f,
++    0.0f, 1.0f, -4.371139E-8f, 0.0f,
++    0.0f, 0.0f, 0.0f, 1.0f,
++};
++
++#define VR_LOOPER_ID_USER 3
++
++struct vr_tracker {
++    struct mp_log *log;
++    pthread_t tid;
++    bool thread_started;
++    atomic_bool run;
++    atomic_bool has_samples;    // first gyro event processed (pose usable)
++    pthread_mutex_t lock;   // guards ekf + last_gyro_ts + looper
++    struct vr_ekf ekf;
++    struct timeval last_gyro_ts;
++    ALooper *looper;        // published by the thread for wake-on-exit
++};
++
++static void *vr_tracker_thread(void *arg)
++{
++    struct vr_tracker *t = arg;
++    prctl(PR_SET_NAME, "mpv-vr-tracker");
++
++    ASensorManager *sensor_manager = ASensorManager_getInstance();
++    if (!sensor_manager) {
++        MP_WARN(t, "VR head tracking: no sensor manager\n");
++        return NULL;
++    }
++    const ASensor *acc =
++        ASensorManager_getDefaultSensor(sensor_manager,
++                                        ASENSOR_TYPE_ACCELEROMETER);
++    const ASensor *gyro =
++        ASensorManager_getDefaultSensor(sensor_manager,
++                                        ASENSOR_TYPE_GYROSCOPE);
++    if (!acc || !gyro) {
++        MP_WARN(t, "VR head tracking: accelerometer/gyroscope unavailable\n");
++        return NULL;
++    }
++    int acc_min_delay = ASensor_getMinDelay(acc);
++    int gyro_min_delay = ASensor_getMinDelay(gyro);
++    ALooper *looper = ALooper_prepare(ALOOPER_PREPARE_ALLOW_NON_CALLBACKS);
++    ASensorEventQueue *event_queue =
++        ASensorManager_createEventQueue(sensor_manager, looper,
++                                        VR_LOOPER_ID_USER, NULL, NULL);
++    ASensorEventQueue_enableSensor(event_queue, acc);
++    ASensorEventQueue_enableSensor(event_queue, gyro);
++    int acc_delay = MPMAX(20000, acc_min_delay);
++    int gyro_delay = MPMAX(20000, gyro_min_delay);
++    ASensorEventQueue_setEventRate(event_queue, acc, acc_delay);
++    ASensorEventQueue_setEventRate(event_queue, gyro, gyro_delay);
++
++    pthread_mutex_lock(&t->lock);
++    t->looper = looper;
++    pthread_mutex_unlock(&t->lock);
++
++    // Upstream used ALooper_pollAll(); NDK r28 removed it, and the official
++    // migration path for this exact loop (no callbacks, single sensor queue)
++    // is pollOnce in a loop, matching the xl_player port done previously in
++    // PiliPlus (see docs/piliplayer.md §14).
++    int ident, events;
++    struct android_poll_source *source;
++    while (atomic_load(&t->run)) {
++        while (atomic_load(&t->run) &&
++               (ident = ALooper_pollOnce(-1, NULL, &events,
++                                         (void **)&source)) >= 0)
++        {
++            if (ident != VR_LOOPER_ID_USER)
++                continue;
++            ASensorEvent event;
++            while (ASensorEventQueue_getEvents(event_queue, &event, 1) > 0) {
++                if (event.type == ASENSOR_TYPE_ACCELEROMETER) {
++                    pthread_mutex_lock(&t->lock);
++                    ekf_process_acceleration(&t->ekf,
++                                             (vr_v3){ -event.data[1],
++                                                       event.data[0],
++                                                       event.data[2] });
++                    pthread_mutex_unlock(&t->lock);
++                } else if (event.type == ASENSOR_TYPE_GYROSCOPE) {
++                    pthread_mutex_lock(&t->lock);
++                    gettimeofday(&t->last_gyro_ts, NULL);
++                    ekf_process_gyro(&t->ekf,
++                                     (vr_v3){ -event.data[1],
++                                               event.data[0],
++                                               event.data[2] },
++                                     (double)event.timestamp);
++                    pthread_mutex_unlock(&t->lock);
++                    // VR_GYRO_CONT: the pose is only meaningful after the
++                    // first gyro sample; the reference is sampled then (not
++                    // at thread start, when the EKF is still at identity).
++                    atomic_store(&t->has_samples, true);
++                }
++            }
++        }
++    }
++
++    ASensorEventQueue_disableSensor(event_queue, acc);
++    ASensorEventQueue_disableSensor(event_queue, gyro);
++    ASensorManager_destroyEventQueue(sensor_manager, event_queue);
++    pthread_mutex_lock(&t->lock);
++    t->looper = NULL;
++    pthread_mutex_unlock(&t->lock);
++    return NULL;
++}
++
++bool vr_tracker_has_samples(struct vr_tracker *t)
++{
++    return t && atomic_load(&t->has_samples);
++}
++
++struct vr_tracker *vr_tracker_create(struct mp_log *log)
++{
++    struct vr_tracker *t = talloc_zero(NULL, struct vr_tracker);
++    t->log = mp_log_new(t, log, "vr/tracker");
++    pthread_mutex_init(&t->lock, NULL);
++    ekf_reset(&t->ekf);
++    atomic_store(&t->run, true);
++    atomic_store(&t->has_samples, false);
++    if (pthread_create(&t->tid, NULL, vr_tracker_thread, t) != 0) {
++        atomic_store(&t->run, false);
++        pthread_mutex_destroy(&t->lock);
++        talloc_free(t);
++        return NULL;
++    }
++    t->thread_started = true;
++    return t;
++}
++
++void vr_tracker_destroy(struct vr_tracker *t)
++{
++    if (!t)
++        return;
++    if (t->thread_started) {
++        atomic_store(&t->run, false);
++        pthread_mutex_lock(&t->lock);
++        ALooper *looper = t->looper;
++        pthread_mutex_unlock(&t->lock);
++        if (looper)
++            ALooper_wake(looper);
++        pthread_join(t->tid, NULL);
++    }
++    pthread_mutex_destroy(&t->lock);
++    talloc_free(t);
++}
++
++void vr_tracker_reset(struct vr_tracker *t)
++{
++    if (!t)
++        return;
++    pthread_mutex_lock(&t->lock);
++    ekf_reset(&t->ekf);
++    pthread_mutex_unlock(&t->lock);
++}
++
++void vr_tracker_get_view(struct vr_tracker *t, float m[16])
++{
++    if (!t) {
++        mat4_identity(m);
++        return;
++    }
++    struct timeval now;
++    gettimeofday(&now, NULL);
++    pthread_mutex_lock(&t->lock);
++    double time_diff_nano =
++        (double)now.tv_sec + (double)now.tv_usec / 1000000.0
++        - (double)t->last_gyro_ts.tv_sec
++        - (double)t->last_gyro_ts.tv_usec / 1000000.0
++        + 0.03333333333333333;
++    ekf_get_predicted_gl_matrix(&t->ekf, time_diff_nano, m);
++    pthread_mutex_unlock(&t->lock);
++    mat4_multiply(m, m, ekf_to_head_tracker);
++}
++
++#else /* !__ANDROID__ */
++
++struct vr_tracker {
++    struct mp_log *log;
++    struct vr_ekf ekf;
++};
++
++bool vr_tracker_has_samples(struct vr_tracker *t)
++{
++    return false;
++}
++
++struct vr_tracker *vr_tracker_create(struct mp_log *log)
++{
++    mp_msg(log, MSGL_V, "VR head tracking is only available on Android\n");
++    return NULL;
++}
++
++void vr_tracker_destroy(struct vr_tracker *t)
++{
++    talloc_free(t);
++}
++
++void vr_tracker_reset(struct vr_tracker *t)
++{
++}
++
++void vr_tracker_get_view(struct vr_tracker *t, float m[16])
++{
++    mat4_identity(m);
++}
++
++#endif
+diff --git a/video/out/gpu/vr_tracker.h b/video/out/gpu/vr_tracker.h
+new file mode 100644
+index 0000000..9e23fe4
+--- /dev/null
++++ b/video/out/gpu/vr_tracker.h
+@@ -0,0 +1,50 @@
++/*
++ * VR head tracker for vo=gpu.
++ *
++ * Ported to C from the Cardboard OrientationEKF implementation vendored from
++ * xl_player (https://github.com/xl-player-developers/xl_player):
++ *   xl_head_tracker/{Vector3d,Matrix3x3d,SO3Util,OrientationEKF,HeadTracker}
++ *   xl_video/xl_tracker.c
++ * The math is a line-by-line port (double precision, same constants, same
++ * update order); only the C++ classes were flattened into structs+functions.
++ *
++ * The sensor thread (NDK ASensorManager + ALooper) only exists on Android;
++ * on other platforms vr_tracker_create() returns NULL and head tracking is
++ * unavailable (manual look-around still works).
++ *
++ * This file is part of mpv.
++ *
++ * mpv is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ */
++
++#pragma once
++
++#include <stdbool.h>
++
++struct mp_log;
++
++struct vr_tracker;
++
++// Create the tracker and start the sensor thread. Returns NULL if head
++// tracking is unavailable on this platform or the sensors could not be
++// opened. Thread-safe against vr_tracker_get_view() from the render thread.
++struct vr_tracker *vr_tracker_create(struct mp_log *log);
++
++// True once the first gyroscope sample has been processed - before that the
++// predicted pose is meaningless (EKF still at its initial state).
++bool vr_tracker_has_samples(struct vr_tracker *t);
++
++// Stop the sensor thread and free everything. Safe to call with NULL/*NULL.
++void vr_tracker_destroy(struct vr_tracker *t);
++
++// Reset the EKF state (re-align to gravity on the next accelerometer event).
++void vr_tracker_reset(struct vr_tracker *t);
++
++// Write the predicted head orientation as a column-major 4x4 GL matrix,
++// including the 33 ms look-ahead compensation and the landscape correction
++// matrix (ekf_to_head_tracker) from upstream xl_tracker.c. If the tracker is
++// not running, writes the identity matrix.
++void vr_tracker_get_view(struct vr_tracker *t, float m[16]);
+diff --git a/video/out/vo.h b/video/out/vo.h
+index 160d860..97fd17e 100644
+--- a/video/out/vo.h
++++ b/video/out/vo.h
+@@ -133,6 +133,10 @@ enum mp_voctrl {
+     // Clipboard
+     VOCTRL_GET_CLIPBOARD,               // struct voctrl_clipboard*
+     VOCTRL_SET_CLIPBOARD,
++
++    // PiliPlus VR: effective view angles (yaw/pitch degrees, head tracking
++    // and folded bias included), data = double[2]. See gpu/vr.c.
++    VOCTRL_VR_VIEW_ANGLES,
+ };
+ 
+ // Helper to expose what kind of content is currently playing to the VO.
+diff --git a/video/out/vo_gpu.c b/video/out/vo_gpu.c
+index 8436833..062a4a4 100644
+--- a/video/out/vo_gpu.c
++++ b/video/out/vo_gpu.c
+@@ -80,6 +80,12 @@ static bool draw_frame(struct vo *vo, struct vo_frame *frame)
+         return VO_FALSE;
+ 
+     gl_video_render_frame(p->renderer, frame, &fbo, RENDER_FRAME_DEF);
++
++    // VR head tracking: keep the VO redrawing (even while paused) so the
++    // rendered view follows the device orientation.
++    if (gl_video_vr_needs_redraw(p->renderer))
++        vo->want_redraw = true;
++
+     if (!sw->fns->submit_frame(sw, frame)) {
+         MP_ERR(vo, "Failed presenting frame!\n");
+         return VO_FALSE;
+@@ -203,6 +209,12 @@ static int control(struct vo *vo, uint32_t request, void *data)
+     case VOCTRL_LOAD_HWDEC_API:
+         request_hwdec_api(vo, data);
+         return true;
++    case VOCTRL_VR_VIEW_ANGLES: {
++        double *angles = data;
++        if (!gl_video_vr_view_angles(p->renderer, &angles[0], &angles[1]))
++            return VO_NOTAVAIL;
++        return VO_TRUE;
++    }
+     case VOCTRL_UPDATE_RENDER_OPTS: {
+         struct ra_ctx_opts *ctx_opts = mp_get_config_group(vo, vo->global, &ra_ctx_conf);
+         update_ra_ctx_options(vo, ctx_opts);

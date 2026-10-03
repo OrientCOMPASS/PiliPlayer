@@ -1,0 +1,338 @@
+name: PiliPlayer CI
+
+# CI for the `piliplayer` branch (Android only).
+# The development sandbox cannot build Flutter apps (2 vCPU / ~10 GiB disk),
+# so every verification (analyze / test / apk build) happens here.
+#
+# **一次构建即发布**(第六轮改的): 以前分支 push 建一次 debug、打 tag 再建
+# debug+release, 每轮白等一次构建。现在只有 tag 触发 push 构建, 且只出
+# release(arm64-v8a) —— check 或构建任一步失败就不会有产物上传, Release 也
+# 不会被填上半成品; 需要 debug 包时用 workflow_dispatch 手动出。
+#
+# 产物(APK + SHA256SUMS)上传到该 tag 对应的 GitHub Release,
+# Release 不存在时自动创建 prerelease(发布说明由发布脚本随后补上)。
+
+on:
+    push:
+        tags:
+            - "v*"
+        paths-ignore:
+            - "**.md"
+            - "docs/**"
+    pull_request:
+        branches:
+            - piliplayer
+    workflow_dispatch:
+        inputs:
+            build_apk:
+                description: "Build Android APK"
+                type: boolean
+                default: true
+            apk_mode:
+                description: "APK build mode"
+                type: choice
+                default: "debug"
+                options:
+                    - debug
+                    - release
+            upload_apk:
+                description: "Upload APK as artifact"
+                type: boolean
+                default: true
+
+concurrency:
+    group: piliplayer-ci-${{ github.ref }}
+    cancel-in-progress: true
+
+permissions:
+    contents: read
+
+env:
+    # paths added by this branch: analyzed with zero tolerance (infos included)
+    STRICT_PATHS: >-
+        lib/pages/local_media
+        lib/pages/video/introduction/local_media
+        lib/services/local_media_service.dart
+        lib/services/smb
+        lib/models/local_media
+        lib/plugin/pl_player/models/vr_projection.dart
+        lib/utils/local_media_progress.dart
+        test/plugin/vr_test.dart
+        test/services/local_media_service_test.dart
+        test/utils/local_media_progress_test.dart
+        test/services/smb/smb_protocol_test.dart
+        test/services/smb/smb_live_test.dart
+        test/services/smb/smb_share_enum_test.dart
+        test/services/smb/smb_browse_test.dart
+        test/services/smb/smb_session_pool_test.dart
+        lib/services/smb/smb_session_pool.dart
+        lib/plugin/pl_player/widgets/vr_control_layer.dart
+        test/services/local_media_source_test.dart
+
+jobs:
+    check:
+        name: Analyze & Test
+        runs-on: ubuntu-latest
+        timeout-minutes: 45
+        steps:
+            - name: 代码迁出
+              uses: actions/checkout@v7
+
+            - name: 安装Flutter
+              uses: subosito/flutter-action@v2
+              with:
+                  channel: stable
+                  flutter-version-file: pubspec.yaml
+                  cache: true
+
+            # patches the Flutter SDK + material_ui / cupertino_ui in pub-cache,
+            # and runs `flutter pub get`
+            - name: Apply Patch
+              shell: pwsh
+              run: lib/scripts/patch.ps1 android
+
+            - name: Analyze (errors are fatal)
+              shell: bash
+              run: |
+                  set -uo pipefail
+                  # 仓库基线本身有若干 info 级提示, 因此这里只把 error 视为失败,
+                  # warning/info 计数写进 job summary; 新增代码另有一步零容忍检查
+                  flutter analyze --no-pub --no-fatal-infos --no-fatal-warnings \
+                    | tee analyze.txt || true
+                  err=$(grep -cE '(^|[[:space:]])error[[:space:]]+•' analyze.txt || true)
+                  warn=$(grep -cE '(^|[[:space:]])warning[[:space:]]+•' analyze.txt || true)
+                  info=$(grep -cE '(^|[[:space:]])info[[:space:]]+•' analyze.txt || true)
+                  echo "::notice::analyze summary errors=$err warnings=$warn infos=$info"
+                  if [ "$err" != "0" ]; then
+                    echo "::error::flutter analyze reported $err error(s)"
+                    grep -E '(^|[[:space:]])error[[:space:]]+•' analyze.txt | head -60
+                    exit 1
+                  fi
+                  echo "analyze: no errors"
+
+            - name: Analyze new code (zero tolerance)
+              shell: bash
+              run: |
+                  set -uo pipefail
+                  paths=""
+                  for p in $STRICT_PATHS; do
+                    [ -e "$p" ] && paths="$paths $p"
+                  done
+                  if [ -z "$paths" ]; then
+                    echo "no strict paths present yet"
+                    exit 0
+                  fi
+                  echo "strict analyze:$paths"
+                  dart analyze --fatal-infos $paths
+
+            - name: Test
+              run: flutter test --no-pub --reporter expanded
+
+    build_android:
+        name: Build Android (${{ matrix.mode }})
+        needs: check
+        runs-on: ubuntu-latest
+        timeout-minutes: 70
+        # 只有 tag(发布)和手动触发才出包; PR 只跑 check, 不浪费构建机时
+        if: >-
+            ${{ (github.event_name != 'workflow_dispatch' || inputs.build_apk)
+            && (github.ref_type == 'tag' || github.event_name == 'workflow_dispatch') }}
+        permissions:
+            # tag 推送时要把构建产物传到对应 Release
+            contents: write
+        strategy:
+            fail-fast: false
+            matrix:
+                # tag -> 只出 release(装机测试用的就是它); 手动触发 -> 所选模式
+                mode: "${{ fromJSON(github.ref_type == 'tag' && '[\"release\"]' || format('[\"{0}\"]', github.event.inputs.apk_mode || 'debug')) }}"
+        steps:
+            - name: 代码迁出
+              uses: actions/checkout@v7
+              with:
+                  fetch-depth: 0
+
+            - name: 构建Java环境
+              uses: actions/setup-java@v5
+              with:
+                  distribution: "zulu"
+                  java-version: "17"
+                  cache: "gradle"
+                  cache-dependency-path: |
+                      android/*.gradle*
+                      android/**/gradle-wrapper.properties
+
+            - name: 安装Flutter
+              uses: subosito/flutter-action@v2
+              with:
+                  channel: stable
+                  flutter-version-file: pubspec.yaml
+                  cache: true
+
+            - name: Apply Patch
+              shell: pwsh
+              run: lib/scripts/patch.ps1 android
+
+            # 让测试包自报家门: 关于页会显示 Commit Hash / Build Time,
+            # 否则装机后无法判断手上这个 apk 到底是哪次提交构建的。
+            - name: 注入构建信息
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  {
+                    echo "PILI_HASH=$(git rev-parse HEAD)"
+                    echo "PILI_TIME=$(date +%s)"
+                    echo "PILI_CODE=$(git rev-list --count HEAD)"
+                  } >> "$GITHUB_ENV"
+
+            - name: Build Debug Apk
+              if: ${{ matrix.mode == 'debug' }}
+              run: >-
+                  flutter build apk --debug --target-platform android-arm64
+                  --dart-define=pili.hash=${{ env.PILI_HASH }}
+                  --dart-define=pili.time=${{ env.PILI_TIME }}
+                  --dart-define=pili.code=${{ env.PILI_CODE }}
+                  --no-pub
+
+            # 测试包只出 arm64-v8a: 真机/平板验证用不到其它 ABI,
+            # 少两条腿能省一半以上的构建时间(上游 build.yml 仍然全 ABI)
+            # release 签名(第十七轮): 仓库 secrets 里配置了 keystore
+            # (KEYSTORE_BASE64/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD)。
+            # android/app/build.gradle.kts 已支持从 android/key.properties 读
+            # release 签名(缺失时回落 debug 签名), 这里只负责把 secrets 落成
+            # 临时文件——key.properties 与 *.jks 都在 .gitignore 里, 不会入库。
+            - name: 配置 release 签名
+              if: ${{ matrix.mode == 'release' }}
+              shell: bash
+              env:
+                  KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+                  KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+                  KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+                  KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+              run: |
+                  set -euo pipefail
+                  # secrets 里的换行/回车一律剥掉(密码本身不受影响:
+                  # keytool 设置的密码不可能含 \r\n)
+                  strip() { printf '%s' "$1" | tr -d '\r\n'; }
+                  sp="$(strip "${KEYSTORE_PASSWORD:-}")"
+                  al="$(strip "${KEY_ALIAS:-}")"
+                  kp="$(strip "${KEY_PASSWORD:-}")"
+                  if [ -z "${KEYSTORE_BASE64:-}" ] || [ -z "$sp" ] || [ -z "$al" ]; then
+                    echo "::error::release 签名 secrets 不完整(KEYSTORE_BASE64/KEYSTORE_PASSWORD/KEY_ALIAS/KEY_PASSWORD)"
+                    exit 1
+                  fi
+                  ks="$RUNNER_TEMP/piliplayer-release.jks"
+                  printf '%s' "$KEYSTORE_BASE64" | tr -d '\r' | base64 -d > "$ks"
+                  # keystore 类型决定 key 密码语义:
+                  #  * PKCS12 —— 格式上只有一个密码, key 密码 == store 密码;
+                  #    keytool -importkeystore 对 PKCS12 会**忽略** -srckeypass
+                  #    (预验假阳性!), 而 AGP 拿不同的 KEY_PASSWORD 去 getKey
+                  #    必报 "Given final block not properly padded"(第十七轮
+                  #    两次 CI 失败的根因)。所以 PKCS12 一律强制 keypass=store
+                  #    密码, 并把类型显式传给 Gradle(storeType)。
+                  #  * JKS —— key 密码独立, importkeystore 预验是真实的;
+                  #    KEY_PASSWORD 解不开再回退 KEYSTORE_PASSWORD。
+                  kstype="$(keytool -list -keystore "$ks" -storepass "$sp" 2>/dev/null \
+                    | sed -n 's/^Keystore type: //p' | head -1)"
+                  echo "keystore type: ${kstype:-unknown}"
+                  probe="$RUNNER_TEMP/sign-probe.p12"
+                  keypass="${kp:-$sp}"
+                  if [ "$kstype" = "PKCS12" ]; then
+                    if [ -n "$kp" ] && [ "$kp" != "$sp" ]; then
+                      echo "::warning::keystore 为 PKCS12: key 密码即 store 密码, KEY_PASSWORD secret 与此不一致已被忽略"
+                    fi
+                    keypass="$sp"
+                  fi
+                  if ! keytool -importkeystore -srckeystore "$ks" \
+                       -srcalias "$al" -srcstorepass "$sp" -srckeypass "$keypass" \
+                       -destkeystore "$probe" -deststoretype PKCS12 \
+                       -deststorepass probe-only -noprompt > /dev/null 2>&1; then
+                    if [ "$keypass" != "$sp" ] && keytool -importkeystore -srckeystore "$ks" \
+                         -srcalias "$al" -srcstorepass "$sp" -srckeypass "$sp" \
+                         -destkeystore "$probe" -deststoretype PKCS12 \
+                         -deststorepass probe-only -noprompt > /dev/null 2>&1; then
+                      echo "::warning::KEY_PASSWORD 无法解密私钥, 已回退使用 KEYSTORE_PASSWORD; 建议修正 KEY_PASSWORD secret"
+                      keypass="$sp"
+                    else
+                      echo "::error::keystore 私钥无法解密: KEY_PASSWORD 与 KEYSTORE_PASSWORD 都打不开别名 '$al' 的私钥, 请核对 secrets"
+                      exit 1
+                    fi
+                  fi
+                  rm -f "$probe"
+                  # 经 $GITHUB_ENV 直传 Gradle(build.gradle.kts 环境变量优先):
+                  # 不写 key.properties —— Java Properties 的转义规则会改写
+                  # 含反斜杠等特殊字符的密码, 上一轮 "Get Key failed: Given
+                  # final block not properly padded" 即此坑。
+                  {
+                    echo "PILI_KEYSTORE_FILE=$ks"
+                    echo "PILI_KEYSTORE_PASSWORD=$sp"
+                    echo "PILI_KEY_ALIAS=$al"
+                    echo "PILI_KEY_PASSWORD=$keypass"
+                    if [ -n "$kstype" ]; then echo "PILI_KEYSTORE_TYPE=$kstype"; fi
+                  } >> "$GITHUB_ENV"
+                  echo "::notice::release 签名已配置并通过私钥解密验证(alias=$al, 环境变量直传)"
+
+            - name: Build Release Apk
+              if: ${{ matrix.mode == 'release' }}
+              run: >-
+                  flutter build apk --release --split-per-abi
+                  --target-platform android-arm64
+                  --android-project-arg dev=1
+                  --dart-define=pili.hash=${{ env.PILI_HASH }}
+                  --dart-define=pili.time=${{ env.PILI_TIME }}
+                  --dart-define=pili.code=${{ env.PILI_CODE }}
+                  --no-pub
+
+            - name: List outputs
+              run: ls -la build/app/outputs/flutter-apk/ || true
+
+            # 出包后核验签名者不是 Android Debug(release 必须用配置的 keystore)
+            - name: 核验 release 签名
+              if: ${{ matrix.mode == 'release' }}
+              shell: bash
+              run: |
+                  set -euo pipefail
+                  apk="$(ls build/app/outputs/flutter-apk/app-arm64-v8a-release.apk)"
+                  owner="$(keytool -printcert -jarfile "$apk" | grep -m1 'Owner:' || true)"
+                  echo "APK 签名者: $owner"
+                  if echo "$owner" | grep -qi 'Android Debug'; then
+                    echo "::error::release APK 仍是 debug 签名, key.properties 未生效"
+                    exit 1
+                  fi
+                  if [ -z "$owner" ]; then
+                    echo "::error::读不到 APK 签名信息"
+                    exit 1
+                  fi
+
+            - name: Upload artifact
+              if: ${{ github.event_name != 'workflow_dispatch' || inputs.upload_apk }}
+              uses: actions/upload-artifact@v7
+              with:
+                  name: PiliPlayer-android-${{ matrix.mode }}-${{ github.sha }}
+                  path: build/app/outputs/flutter-apk/*.apk
+                  if-no-files-found: error
+                  retention-days: 14
+
+            # tag 推送: 把本 leg 的全部 APK 传到该 tag 的 GitHub Release。
+            # Release 一般已提前建好; 没有就兜底建一个 prerelease
+            # (debug/release 两条腿并发, create 用 || true 兜竞态)。
+            - name: 上传到 tag Release
+              if: ${{ github.ref_type == 'tag' }}
+              shell: bash
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  tag="$GITHUB_REF_NAME"
+                  mode="${{ matrix.mode }}"
+                  cd build/app/outputs/flutter-apk
+                  ls -la
+                  sums="PiliPlayer-${tag}-${mode}-SHA256SUMS.txt"
+                  sha256sum ./*.apk > "$sums"
+                  cat "$sums"
+                  if ! gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+                    gh release create "$tag" --repo "$GITHUB_REPOSITORY" --prerelease \
+                      --title "PiliPlayer ${tag} (测试构建)" \
+                      --notes "由 CI 自动创建, 构建自 ${GITHUB_SHA}。" || true
+                  fi
+                  gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber ./*.apk "$sums"
+                  echo "::notice::已上传 ${mode} 构建产物到 release ${tag}"

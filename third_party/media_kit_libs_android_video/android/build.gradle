@@ -1,0 +1,114 @@
+import java.io.File
+import java.nio.file.Files
+import java.security.MessageDigest
+
+group 'com.alexmercerind.media_kit_libs_android_video'
+version '1.0'
+
+buildscript {
+    repositories {
+        google()
+        mavenCentral()
+    }
+
+    dependencies {
+        classpath 'com.android.tools.build:gradle:7.3.0'
+    }
+}
+
+rootProject.allprojects {
+    repositories {
+        google()
+        mavenCentral()
+    }
+}
+
+apply plugin: 'com.android.library'
+
+android {
+    // Conditional for compatibility with AGP <4.2.
+    if (project.android.hasProperty("namespace")) {
+        namespace 'com.alexmercerind.media_kit_libs_android_video'
+    }
+
+    compileSdkVersion 31
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_1_8
+        targetCompatibility JavaVersion.VERSION_1_8
+    }
+
+    defaultConfig {
+        minSdkVersion 16
+    }
+
+    dependencies {
+        implementation fileTree(dir: "$buildDir/output", include: "*.jar")
+    }
+}
+
+// [PiliPlus] Vendored copy of media_kit_libs_android_video (media-kit fork
+// `My-Responsitories/media-kit` ref native @ 73771ec, package version 1.3.7).
+// The ONLY change vs upstream: the arm64-v8a jar now comes from this
+// repository's rolling `libmpv-vr` release — the VR-patched libmpv built by
+// .github/workflows/libmpv_vr.yml (mpv v0.41.0 + VR reprojection patches,
+// all other .so files byte-identical to the upstream 20260906 jar).
+// armeabi-v7a / x86_64 keep the pinned upstream jars with sha256 checks.
+// The rolling jar cannot be sha256-pinned (it is rebuilt in place); its
+// checksum is printed below and also published next to it as
+// default-arm64-v8a.jar.sha256, and the build that produces it verifies the
+// upstream base jar it is assembled from.
+task downloadDependencies(type: Exec) {
+        // Delete previously created /output subdirectory.
+
+        def outputDir = file("$buildDir/output")
+        if (outputDir.exists()) {
+            outputDir.deleteDir()
+        }
+        outputDir.mkdirs()
+
+        // Download all *.jar dependencies & verify their sha256 checksums
+        // (empty sha256 = verify not possible for rolling asset, log only).
+        def filesToDownload = [
+            ["url": "https://github.com/OrientCOMPASS/PiliPlus/releases/download/libmpv-vr/default-arm64-v8a.jar", "sha256": "", "destination": file("$buildDir/libmpv-vr/default-arm64-v8a.jar")],
+            ["url": "https://github.com/My-Responsitories/libmpv-android-video-build/releases/download/20260906/default-armeabi-v7a.jar", "sha256": "75ba2199848cd6224817320ddfabb7d7ea48fb4cfb1721b0090043d5a8a38602", "destination": file("$buildDir/20260906/default-armeabi-v7a.jar")],
+            ["url": "https://github.com/My-Responsitories/libmpv-android-video-build/releases/download/20260906/default-x86_64.jar", "sha256": "1caa6198de22808bd7f10fcff2923f5eb174cc42ef24569aeafb98c6597457a4", "destination": file("$buildDir/20260906/default-x86_64.jar")],
+        ]
+
+        filesToDownload.each { fileInfo ->
+            def destFile = fileInfo.destination
+            if (destFile.exists() && fileInfo.sha256) {
+                def calculatedSHA256 = MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(destFile.toPath())).encodeHex().toString()
+
+                if (calculatedSHA256 != fileInfo.sha256) {
+                    destFile.delete()
+                    println "SHA-256 mismatch. File deleted: ${destFile}"
+                }
+
+            }
+
+            if (!destFile.exists()) {
+                destFile.parentFile.mkdirs()
+                println "Downloading file from: ${fileInfo.url}"
+                destFile.withOutputStream { os ->
+                    os << new URL(fileInfo.url).openStream()
+                }
+            }
+
+            def calculatedSHA256 = MessageDigest.getInstance("SHA-256").digest(Files.readAllBytes(destFile.toPath())).encodeHex().toString()
+            if (fileInfo.sha256) {
+                if (calculatedSHA256 != fileInfo.sha256) {
+                    throw new GradleException("SHA-256 verification failed for ${destFile}")
+                }
+            } else {
+                println "NOTE: rolling asset ${destFile.name} sha256=${calculatedSHA256} (compare with the libmpv-vr release asset default-arm64-v8a.jar.sha256)"
+            }
+
+            copy {
+                from destFile
+                into outputDir
+            }
+        }
+}
+
+assemble.dependsOn(downloadDependencies)

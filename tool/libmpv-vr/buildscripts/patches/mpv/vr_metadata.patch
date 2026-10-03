@@ -1,0 +1,278 @@
+diff --git a/demux/demux_lavf.c b/demux/demux_lavf.c
+index 7013dbd..bfdd336 100644
+--- a/demux/demux_lavf.c
++++ b/demux/demux_lavf.c
+@@ -37,6 +37,8 @@
+ #include <libavutil/opt.h>
+ #include <libavutil/pixdesc.h>
+ #include <libavutil/replaygain.h>
++#include <libavutil/spherical.h>
++#include <libavutil/stereo3d.h>
+ 
+ #include "audio/chmap_avchannel.h"
+ 
+@@ -610,6 +612,58 @@ static inline const uint8_t *mp_av_stream_get_side_data(const AVStream *st,
+     return sd ? sd->data : NULL;
+ }
+ 
++// VR / panoramic source metadata (PiliPlus): map the lavf spherical side data
++// onto the horizontal coverage the VR renderer (vo=gpu vr.c) understands.
++// The renderer supports full and half equirectangular maps only; everything
++// else is reported so the client can say "unsupported" instead of failing
++// silently.
++static int mp_vr_projection_from_spherical(const AVSphericalMapping *sph)
++{
++    switch (sph->projection) {
++    case AV_SPHERICAL_EQUIRECTANGULAR:
++        return MP_VR_PROJ_360;
++    case AV_SPHERICAL_HALF_EQUIRECTANGULAR:
++        return MP_VR_PROJ_180;
++    case AV_SPHERICAL_EQUIRECTANGULAR_TILE: {
++        // bound_* are 0.32 fixed point fractions of the FULL map (see
++        // av_spherical_tile_bounds): the frame covers the middle part, so
++        // coverage = 360° * (1 - (left + right) / UINT32_MAX). Quantize to
++        // the two coverages the renderer can build meshes for.
++        double frac = 1.0 - ((double)sph->bound_left +
++                             (double)sph->bound_right) / UINT32_MAX;
++        double cov = 360.0 * frac;
++        if (cov >= 300.0)
++            return MP_VR_PROJ_360;
++        if (cov >= 150.0)
++            return MP_VR_PROJ_180;
++        return MP_VR_PROJ_OTHER;
++    }
++    case AV_SPHERICAL_CUBEMAP:
++        return MP_VR_PROJ_CUBEMAP;
++    case AV_SPHERICAL_RECTILINEAR:
++        // Explicitly flat - treat like "no panoramic metadata".
++        return MP_VR_PROJ_NONE;
++    default:
++        // Fisheye / parametric immersive / future types.
++        return MP_VR_PROJ_OTHER;
++    }
++}
++
++static int mp_vr_layout_from_stereo3d(const AVStereo3D *s3d)
++{
++    switch (s3d->type) {
++    case AV_STEREO3D_2D:
++        return MP_VR_LAYOUT_MONO;
++    case AV_STEREO3D_SIDEBYSIDE:
++        return MP_VR_LAYOUT_SBS;
++    case AV_STEREO3D_TOPBOTTOM:
++        return MP_VR_LAYOUT_TB;
++    default:
++        // Checkerboard, lines/columns, frame sequencing, quincunx, ...
++        return MP_VR_LAYOUT_OTHER;
++    }
++}
++
+ static void export_replaygain(demuxer_t *demuxer, struct sh_stream *sh,
+                               AVStream *st)
+ {
+@@ -770,6 +824,22 @@ static void handle_new_stream(demuxer_t *demuxer, int i)
+             sh->codec->dv_level = cfg->dv_level;
+         }
+ 
++        // VR / panoramic source metadata (PiliPlus): spherical projection
++        // (sv3d/prji in mp4, Projection in mkv) and stereo arrangement
++        // (st3d in mp4, StereoMode in mkv), exposed through the
++        // vr-metadata-projection / vr-metadata-layout properties.
++        if ((sd = mp_av_stream_get_side_data(st, AV_PKT_DATA_SPHERICAL))) {
++            const AVSphericalMapping *sph = (const AVSphericalMapping *)sd;
++            sh->codec->vr_projection = mp_vr_projection_from_spherical(sph);
++            MP_VERBOSE(demuxer, "Found spherical metadata: %s (vr projection "
++                       "%d)\n", av_spherical_projection_name(sph->projection),
++                       sh->codec->vr_projection);
++        }
++        if ((sd = mp_av_stream_get_side_data(st, AV_PKT_DATA_STEREO3D))) {
++            sh->codec->vr_layout =
++                mp_vr_layout_from_stereo3d((const AVStereo3D *)sd);
++        }
++
+         // This also applies to vfw-muxed mkv, but we can't detect these easily.
+         sh->codec->avi_dts = matches_avinputformat_name(priv, "avi");
+ 
+diff --git a/demux/demux_mkv.c b/demux/demux_mkv.c
+index 501d20e..d71ae2d 100644
+--- a/demux/demux_mkv.c
++++ b/demux/demux_mkv.c
+@@ -119,6 +119,10 @@ typedef struct mkv_track {
+     float v_projection_pose_yaw;
+     float v_projection_pose_pitch;
+     float v_projection_pose_roll;
++    // Matroska ProjectionType (0 rect / 1 equirect / 2 cubemap / 3 mesh);
++    // VR / panoramic metadata export, PiliPlus
++    uint64_t v_projection_type;
++    bool v_projection_type_set;
+ 
+     uint32_t a_channels, a_bps;
+     float a_sfreq;
+@@ -692,6 +696,13 @@ static void parse_trackcolour(struct demuxer *demuxer, struct mkv_track *track,
+ static void parse_trackprojection(struct demuxer *demuxer, struct mkv_track *track,
+                                   struct ebml_projection *projection)
+ {
++    if (projection->n_projection_type) {
++        track->v_projection_type = projection->projection_type;
++        track->v_projection_type_set = true;
++        MP_DBG(demuxer, "|   + Projection type: %"PRIu64"\n",
++               track->v_projection_type);
++    }
++
+     if (projection->n_projection_pose_yaw) {
+         track->v_projection_pose_yaw = projection->projection_pose_yaw;
+         MP_DBG(demuxer, "|   + Projection pose yaw: %f\n",
+@@ -1755,6 +1766,29 @@ static int demux_mkv_open_video(demuxer_t *demuxer, mkv_track_t *track)
+         sh_v->rotate = rotate;
+     }
+ 
++    // VR / panoramic source metadata (PiliPlus). Matroska carries the
++    // projection type in the Projection element and the stereo arrangement in
++    // StereoMode; map both onto the vr-metadata-* property enums so the app's
++    // "auto (by source metadata)" mode works for .mkv/.webm too (the lavf
++    // demuxer path covers mp4/mov). See demux_lavf.c for the lavf equivalent.
++    if (track->v_projection_type_set) {
++        switch (track->v_projection_type) {
++        case 0: sh_v->vr_projection = MP_VR_PROJ_NONE; break;    // rectangular
++        case 1: sh_v->vr_projection = MP_VR_PROJ_360; break;     // equirect
++        case 2: sh_v->vr_projection = MP_VR_PROJ_CUBEMAP; break; // cubemap
++        default: sh_v->vr_projection = MP_VR_PROJ_OTHER; break;  // mesh / unknown
++        }
++    }
++    switch (track->stereo_mode) {
++    case MP_STEREO3D_MONO: sh_v->vr_layout = MP_VR_LAYOUT_MONO; break;
++    case MP_STEREO3D_SBS2L:
++    case MP_STEREO3D_SBS2R: sh_v->vr_layout = MP_VR_LAYOUT_SBS; break;
++    case MP_STEREO3D_AB2L:
++    case MP_STEREO3D_AB2R: sh_v->vr_layout = MP_VR_LAYOUT_TB; break;
++    case MP_STEREO3D_INVALID: sh_v->vr_layout = MP_VR_LAYOUT_NONE; break;
++    default: sh_v->vr_layout = MP_VR_LAYOUT_OTHER; break; // checkerboard etc.
++    }
++
+     // our vessel to transport global track side data to decoder context;
+     // this gets called in all lavc decoders through `mp_set_avctx_codec_headers`
+     // and its failure causes decoding failure. Thus if this call fails here, it is
+diff --git a/demux/stheader.h b/demux/stheader.h
+index 42046a4..347b64f 100644
+--- a/demux/stheader.h
++++ b/demux/stheader.h
+@@ -28,6 +28,29 @@
+ struct MPOpts;
+ struct demuxer;
+ 
++// VR / panoramic source metadata (PiliPlus). Set by the lavf demuxer from the
++// stream's spherical / stereo3d side data, exposed to clients as the
++// read-only `vr-metadata-projection` / `vr-metadata-layout` properties so the
++// app can resolve its "auto (by source metadata)" VR mode. Deliberately
++// separate from mp_codec_params.stereo_mode, which feeds mpv's own 3D OSD
++// machinery.
++enum {
++    MP_VR_PROJ_NONE = 0,    // no panoramic metadata (or plain 2D/rectilinear)
++    MP_VR_PROJ_360,         // equirectangular, full 360° horizontal coverage
++    MP_VR_PROJ_180,         // equirectangular, ~180° horizontal coverage
++    MP_VR_PROJ_CUBEMAP,     // cubemap layout (not supported by the VR renderer)
++    MP_VR_PROJ_OTHER,       // known but unsupported (fisheye, immersive, odd
++                            // tiles, unusual stereo arrangements, ...)
++};
++
++enum {
++    MP_VR_LAYOUT_NONE = 0,  // no stereo metadata (assume single view)
++    MP_VR_LAYOUT_MONO,      // explicitly declared flat/2D
++    MP_VR_LAYOUT_SBS,       // side by side (left/right)
++    MP_VR_LAYOUT_TB,        // top bottom (over/under)
++    MP_VR_LAYOUT_OTHER,     // checkerboard/interleaved/... (not supported)
++};
++
+ // Stream headers:
+ 
+ struct sh_stream {
+@@ -119,6 +142,9 @@ struct mp_codec_params {
+     int disp_w, disp_h;   // display size
+     int rotate;           // intended display rotation, in degrees, [0, 359]
+     int stereo_mode;      // mp_stereo3d_mode (0 if none/unknown)
++    // VR / panoramic source metadata (PiliPlus, see MP_VR_* enums above)
++    int vr_projection;    // MP_VR_PROJ_*
++    int vr_layout;        // MP_VR_LAYOUT_*
+     struct pl_color_space color; // colorspace info where available
+     struct pl_color_repr repr;   // color representation info where available
+     enum pl_chroma_location chroma_location; // chroma location
+diff --git a/player/command.c b/player/command.c
+index 96bc06a..bba743e 100644
+--- a/player/command.c
++++ b/player/command.c
+@@ -2620,6 +2620,63 @@ static int mp_property_vd_imgparams(void *ctx, struct m_property *prop,
+     return M_PROPERTY_UNAVAILABLE;
+ }
+ 
++// VR / panoramic source metadata (PiliPlus): read-only strings describing
++// what the demuxer found in the stream's spherical / stereo3d side data.
++// Consumed by the app's "auto (by source metadata)" VR mode:
++//   vr-metadata-projection: none | 360 | 180 | cubemap | other
++//   vr-metadata-layout:     none | mono | sbs | tb | other
++// "cubemap"/"other" mean: recognized as panoramic/3D, but not renderable by
++// the VR renderer (clients must say so explicitly instead of failing
++// silently). Available as soon as the file is loaded (tracks exist), the
++// value does not change during playback.
++static int mp_property_vr_metadata(void *ctx, struct m_property *prop,
++                                   int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct track *track = mpctx->current_track[0][STREAM_VIDEO];
++    struct mp_codec_params *c =
++        track && track->stream ? track->stream->codec : NULL;
++    if (!c)
++        return M_PROPERTY_UNAVAILABLE;
++
++    const char *type = prop->priv;
++    const char *val = "none";
++    if (type[0] == 'l') {
++        switch (c->vr_layout) {
++        case MP_VR_LAYOUT_MONO:  val = "mono";  break;
++        case MP_VR_LAYOUT_SBS:   val = "sbs";   break;
++        case MP_VR_LAYOUT_TB:    val = "tb";    break;
++        case MP_VR_LAYOUT_OTHER: val = "other"; break;
++        }
++    } else {
++        switch (c->vr_projection) {
++        case MP_VR_PROJ_360:     val = "360";     break;
++        case MP_VR_PROJ_180:     val = "180";     break;
++        case MP_VR_PROJ_CUBEMAP: val = "cubemap"; break;
++        case MP_VR_PROJ_OTHER:   val = "other";   break;
++        }
++    }
++    return m_property_strdup_ro(action, arg, val);
++}
++
++// PiliPlus VR: the *effective* view angles (manual offsets + folded gyro
++// bias + head pose) as rendered by vo=gpu's VR renderer, so the client HUD
++// can show the real look direction instead of only the manual component.
++static int mp_property_vr_view_angle(void *ctx, struct m_property *prop,
++                                     int action, void *arg)
++{
++    MPContext *mpctx = ctx;
++    struct vo *vo = mpctx->video_out;
++    if (!vo)
++        return M_PROPERTY_UNAVAILABLE;
++    double angles[2] = {0, 0};
++    if (vo_control(vo, VOCTRL_VR_VIEW_ANGLES, angles) <= 0)
++        return M_PROPERTY_UNAVAILABLE;
++    const char *which = prop->priv;
++    return m_property_double_ro(action, arg,
++                                which[0] == 'y' ? angles[0] : angles[1]);
++}
++
+ static int mp_property_video_frame_info(void *ctx, struct m_property *prop,
+                                         int action, void *arg)
+ {
+@@ -4447,6 +4504,11 @@ static const struct m_property mp_properties_base[] = {
+     {"video-dec-params", mp_property_dec_imgparams},
+     {"video-params", mp_property_vd_imgparams},
+     {"video-frame-info", mp_property_video_frame_info},
++    // VR / panoramic source metadata (PiliPlus)
++    {"vr-metadata-projection", mp_property_vr_metadata, .priv = "projection"},
++    {"vr-metadata-layout", mp_property_vr_metadata, .priv = "layout"},
++    {"vr-view-yaw", mp_property_vr_view_angle, .priv = "yaw"},
++    {"vr-view-pitch", mp_property_vr_view_angle, .priv = "pitch"},
+     M_PROPERTY_ALIAS("video-format", "current-tracks/video/codec"),
+     M_PROPERTY_ALIAS("video-codec", "current-tracks/video/codec-desc"),
+     M_PROPERTY_ALIAS("dwidth", "video-out-params/dw"),

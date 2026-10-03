@@ -1,0 +1,120 @@
+name: libmpv VR (arm64)
+
+# Builds the VR-patched libmpv.so for arm64-v8a and publishes the media_kit
+# Android jar (upstream 20260906 jar with only lib/arm64-v8a/libmpv.so
+# replaced) to the rolling release tag `libmpv-vr` of THIS repository.
+#
+# The app's vendored media_kit_libs_android_video package
+# (third_party/media_kit_libs_android_video) downloads that jar at gradle
+# time, so after this workflow succeeds, app CI picks up the new libmpv
+# automatically.
+#
+# Build scripts live in tool/libmpv-vr (copied from
+# My-Responsitories/libmpv-android-video-build @ 8e50ecc == the state that
+# produced the 20260906 release the app pins; see tool/libmpv-vr/README.md).
+
+on:
+    workflow_dispatch:
+        inputs:
+            publish:
+                description: "Publish jar to the rolling libmpv-vr release"
+                type: boolean
+                default: true
+    push:
+        branches:
+            - piliplayer
+        paths:
+            - "tool/libmpv-vr/**"
+            - ".github/workflows/libmpv_vr.yml"
+
+permissions:
+    contents: write
+
+concurrency:
+    group: libmpv-vr
+    cancel-in-progress: true
+
+jobs:
+    build:
+        name: Build VR libmpv + jar
+        runs-on: ubuntu-22.04
+        timeout-minutes: 90
+        defaults:
+            run:
+                working-directory: tool/libmpv-vr/buildscripts
+        steps:
+            - name: 代码迁出
+              uses: actions/checkout@v7
+
+            - name: 构建Java环境
+              uses: actions/setup-java@v5
+              with:
+                  distribution: temurin
+                  java-version: 21
+
+            # deps/ + prefix/ are cached across runs so that patch iterations
+            # only rebuild mpv (~5 min instead of ~25 min). The key covers
+            # the dependency versions and dep build scripts, but NOT the mpv
+            # patch or scripts/mpv.sh, so changing those stays fast.
+            - name: 恢复依赖缓存
+              uses: actions/cache@v4
+              with:
+                  path: |
+                      tool/libmpv-vr/buildscripts/deps
+                      tool/libmpv-vr/buildscripts/prefix
+                  key: >-
+                      libmpv-deps-v1-${{ hashFiles(
+                        'tool/libmpv-vr/buildscripts/include/depinfo.sh',
+                        'tool/libmpv-vr/buildscripts/include/download-deps.sh',
+                        'tool/libmpv-vr/buildscripts/flavors/default.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/dav1d.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/freetype.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/fribidi.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/harfbuzz.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/libass.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/libplacebo.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/libsmb2.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/libwebp.sh',
+                        'tool/libmpv-vr/buildscripts/scripts/mbedtls.sh'
+                      ) }}
+
+            - name: Symlink SDK
+              run: |
+                  mkdir -p sdk
+                  [ -e sdk/android-sdk-linux ] || ln -s "${ANDROID_HOME}" sdk/android-sdk-linux
+
+            - name: Bundle (VR, arm64 only)
+              run: |
+                  chmod +x *.sh include/*.sh scripts/*.sh 2>/dev/null || true
+                  ./bundle_vr_arm64.sh
+
+            - name: 上传产物
+              uses: actions/upload-artifact@v7
+              with:
+                  name: libmpv-vr-arm64-${{ github.sha }}
+                  path: tool/libmpv-vr/output/*
+                  if-no-files-found: error
+                  retention-days: 30
+
+            - name: 发布到滚动 Release (libmpv-vr)
+              if: ${{ github.event_name == 'push' || inputs.publish }}
+              env:
+                  GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  cd ../output
+                  tag="libmpv-vr"
+                  notes="VR 版 libmpv (arm64-v8a) — 由 PiliPlus 提交 ${GITHUB_SHA} 构建。
+
+                  - 基线: mpv v0.41.0 + patches/mpv/*(VR 重投影 + java-vm), ffmpeg n9.0.1 (default flavor)
+                  - jar 内其余 .so 与上游 20260906 逐字节一致, 仅替换 libmpv.so
+                  - sha256: $(cut -d' ' -f1 default-arm64-v8a.jar.sha256)"
+                  if ! gh release view "$tag" >/dev/null 2>&1; then
+                    gh release create "$tag" --prerelease \
+                      --title "libmpv VR (arm64-v8a) 滚动构建" --notes "$notes"
+                  else
+                    gh release edit "$tag" --notes "$notes"
+                  fi
+                  gh release upload "$tag" --clobber \
+                    default-arm64-v8a.jar default-arm64-v8a.jar.sha256
+                  echo "::notice::已发布 default-arm64-v8a.jar 到 release ${tag}"

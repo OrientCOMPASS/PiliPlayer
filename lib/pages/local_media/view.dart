@@ -320,9 +320,13 @@ class _LocalMediaPageState extends State<LocalMediaPage>
   }
 
   Widget _buildSource(BuildContext context, LocalMediaSource source) {
-    final subtitle = source.type == LocalMediaSourceType.device
-        ? source.url
-        : LocalMediaService.maskedUrl(source.url);
+    // SAF 收藏显示可读路径(内部存储/Download/电影), 直读显示绝对路径,
+    // 网络来源显示脱敏地址
+    final subtitle = switch (source) {
+      LocalMediaSource(isSafTree: true) => LocalMediaService.safLabel(source),
+      LocalMediaSource(type: LocalMediaSourceType.device) => source.url,
+      _ => LocalMediaService.maskedUrl(source.url),
+    };
     return ListTile(
       leading: Icon(_sourceIcon(source.type)),
       title: Text(source.name, maxLines: 1, overflow: TextOverflow.ellipsis),
@@ -336,7 +340,7 @@ class _LocalMediaPageState extends State<LocalMediaPage>
   }
 
   IconData _sourceIcon(LocalMediaSourceType type) => switch (type) {
-    LocalMediaSourceType.device => Icons.smartphone_outlined,
+    LocalMediaSourceType.device => Icons.folder_outlined,
     LocalMediaSourceType.smb => Icons.folder_shared_outlined,
     LocalMediaSourceType.webdav => Icons.cloud_outlined,
     LocalMediaSourceType.http => Icons.language_outlined,
@@ -372,15 +376,18 @@ class _LocalMediaPageState extends State<LocalMediaPage>
                   }
                 },
               ),
-            ListTile(
-              dense: true,
-              leading: const Icon(Icons.edit_outlined),
-              title: const Text('编辑'),
-              onTap: () async {
-                Navigator.of(dialogContext).pop();
-                await _controller.editSource(context, source);
-              },
-            ),
+            // 编辑器只认网络协议(SMB/WebDAV/HTTP/FTP); 本机条目(SAF 授权
+            // 或直读路径)进去会被改成 WebDAV, 所以不给编辑入口, 只留删除
+            if (source.type.isNetwork)
+              ListTile(
+                dense: true,
+                leading: const Icon(Icons.edit_outlined),
+                title: const Text('编辑'),
+                onTap: () async {
+                  Navigator.of(dialogContext).pop();
+                  await _controller.editSource(context, source);
+                },
+              ),
             ListTile(
               dense: true,
               leading: const Icon(Icons.delete_outline),

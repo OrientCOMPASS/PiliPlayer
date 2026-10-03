@@ -154,7 +154,7 @@ abstract final class SafBridge {
       final raw = await _channel
           .invokeMethod<Map<dynamic, dynamic>?>(
             'safPickTree',
-            <String, Object?>{if (initialUri != null) 'initialUri': initialUri},
+            <String, Object?>{'initialUri': ?initialUri},
           )
           .timeout(_pickTimeout);
       return SafTree.fromMap(raw);
@@ -183,8 +183,7 @@ abstract final class SafBridge {
     try {
       final raw = await _channel.invokeMethod<List<dynamic>?>('safTrees');
       return [
-        for (final e in raw ?? const <dynamic>[])
-          if (SafTree.fromMap(e) case final tree?) tree,
+        for (final e in raw ?? const <dynamic>[]) ?SafTree.fromMap(e),
       ];
     } on PlatformException catch (e) {
       throw SafFailure(e.message ?? '读取已授权目录失败');
@@ -305,7 +304,9 @@ abstract final class SafBridge {
     }
     try {
       await _channel.invokeMethod<bool>('closeAllFds');
-    } on Object {}
+    } on Object {
+      // 关不掉也有 Kotlin 侧的 LRU 兜底, 不影响功能
+    }
   }
 
   // ==================== 纯函数(docId 语义) ====================

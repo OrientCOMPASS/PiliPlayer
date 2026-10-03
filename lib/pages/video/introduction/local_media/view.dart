@@ -184,7 +184,6 @@ class _LocalMediaIntroPanelState extends State<LocalMediaIntroPanel>
   void scrollToCurrent({bool animate = true}) {
     final position = Scrollable.maybeOf(context)?.position;
     if (position == null ||
-        !position.hasClients ||
         !position.hasContentDimensions ||
         !position.hasViewportDimension) {
       return;

@@ -85,7 +85,8 @@ abstract final class GamepadBridge {
       );
     } on PlatformException {
       return GamepadAxes.zero;
-    } on MissingPluginException {
+    } catch (_) {
+      // MissingPluginException 等: 通道没注册(极老的宿主)也不该影响播放
       return GamepadAxes.zero;
     }
   }
@@ -97,17 +98,15 @@ abstract final class GamepadBridge {
     }
     try {
       await _channel.invokeMethod<bool>('reset');
-    } on PlatformException {
+    } catch (_) {
       // 忽略: 清不掉也只是下一次采样覆盖它
-    } on MissingPluginException {
-      // 忽略
     }
   }
 
+  // num 的两种子类(double/int)都已覆盖, 再写一条 num 分支是不可达代码
   static double _asDouble(Object? value) => switch (value) {
     double v => v.isNaN || v.isInfinite ? 0 : v,
     int v => v.toDouble(),
-    num v => v.toDouble(),
     _ => 0,
   };
 

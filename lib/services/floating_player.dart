@@ -1,7 +1,11 @@
-import 'dart:async' show unawaited;
+import 'dart:async' show Timer, unawaited;
 import 'dart:io' show Platform;
 
+import 'package:PiliPlus/models/common/video/source_type.dart';
+import 'package:PiliPlus/models/local_media/local_media_item.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
+import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
+import 'package:PiliPlus/utils/local_media_progress.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
@@ -45,6 +49,10 @@ class FloatingPlayerService {
   String _restoreRoute = '/videoV';
 
   String _title = '';
+
+  /// 小窗期间要续存进度的本地/局域网条目(在线视频走 B 站心跳, 这里不管)
+  LocalMediaItem? _progressItem;
+  Timer? _progressTimer;
 
   bool get isActive => active.value;
 
@@ -91,6 +99,7 @@ class FloatingPlayerService {
       return;
     }
     active.value = true;
+    _startProgressSaver(controller, _restoreArgs);
 
     // 播放页出栈 —— 下面的页面立刻可见可点, 这就是"只收起播放页"
     final navigator = Navigator.maybeOf(context, rootNavigator: true);
@@ -112,7 +121,7 @@ class FloatingPlayerService {
     final progressMs = controller.positionInMilliseconds;
     final cid = args['cid'];
     final route = _restoreRoute;
-    _teardownEntry();
+    _teardownEntry(saveProgress: true);
     // 交还给播放页: 页面会正常走 setDataSource(单例播放器复用),
     // 因此这里必须清掉保活标记, 否则用户再退出时播放器不会被销毁
     controller.floatingKeepAlive = false;
@@ -136,7 +145,7 @@ class FloatingPlayerService {
   /// 关闭小窗并销毁播放器
   void close() {
     final controller = _controller;
-    _teardownEntry();
+    _teardownEntry(saveProgress: true);
     _restoreArgs = null;
     if (controller != null) {
       controller.floatingKeepAlive = false;
@@ -176,7 +185,9 @@ class FloatingPlayerService {
     return true;
   }
 
-  void _teardownEntry() {
+  /// 摘掉浮窗(顺带把小窗里看到的位置存一次盘)
+  void _teardownEntry({bool saveProgress = false}) {
+    _stopProgressSaver(save: saveProgress);
     active.value = false;
     final entry = _entry;
     _entry = null;
@@ -185,6 +196,61 @@ class FloatingPlayerService {
         ..remove()
         ..dispose();
     }
+  }
+
+  // ==================== 小窗期间的续播进度 ====================
+
+  /// 播放页出栈时, 它的"每 5 秒落盘一次续播进度"监听也跟着没了。小窗里
+  /// 看的时间同样要记住(否则关掉小窗再进这个文件, 会跳回进小窗前的位置),
+  /// 所以这里补一个同样节奏的定时器。只针对本地/局域网媒体 —— 在线视频的
+  /// 历史心跳由播放器自己维持, 不该在这里重复上报。
+  void _startProgressSaver(
+    PlPlayerController controller,
+    Map<dynamic, dynamic>? args,
+  ) {
+    // 注意: 三元表达式里不要写 `args?['k']`(解析器会把第二个 ? 当成
+    // 嵌套三元), 先做非空判断再取。
+    final item = args != null && args['sourceType'] == SourceType.localMedia
+        ? args['localMedia']
+        : null;
+    if (item is! LocalMediaItem || item.uri.startsWith('fd://')) {
+      return; // fd:// 每次会话都不同, 存了也没意义(与播放页一致)
+    }
+    _progressItem = item;
+    _progressTimer?.cancel();
+    _progressTimer = Timer.periodic(
+      const Duration(seconds: 5),
+      (_) => _saveProgress(controller),
+    );
+  }
+
+  void _saveProgress(PlPlayerController controller) {
+    final item = _progressItem;
+    if (item == null) {
+      return;
+    }
+    final ms = controller.positionInMilliseconds;
+    if (ms <= 0) {
+      return;
+    }
+    final total = controller.durationInMilliseconds;
+    LocalMediaProgress.put(
+      item.uri,
+      Duration(milliseconds: ms),
+      duration: total > 0 ? Duration(milliseconds: total) : null,
+    );
+  }
+
+  void _stopProgressSaver({bool save = false}) {
+    _progressTimer?.cancel();
+    _progressTimer = null;
+    if (save) {
+      final controller = _controller;
+      if (controller != null) {
+        _saveProgress(controller);
+      }
+    }
+    _progressItem = null;
   }
 
   /// root Overlay(所有路由都在它下面) —— 小窗必须插在这一层, 否则用户一进

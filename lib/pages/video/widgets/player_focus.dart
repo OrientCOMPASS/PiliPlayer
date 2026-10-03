@@ -100,14 +100,15 @@ class PlayerFocus extends StatelessWidget {
     // 弹出播放器 UI 只会挡住画面与 VR 按钮(需求原文: 手柄操作不应唤起
     // 播放器 UI)。摇杆部分见 VrControlLayer 的 GamepadPoller。
     if (plPlayerController.vrControlMode.value) {
+      // 只认 KeyDownEvent: 长按产生的 KeyRepeatEvent 不会重复触发
       if (key == LogicalKeyboardKey.gameButtonY) {
-        if (event is KeyDownEvent && !event.repeat) {
+        if (event is KeyDownEvent) {
           plPlayerController.resetVrView();
         }
         return true;
       }
       if (key == LogicalKeyboardKey.gameButtonX) {
-        if (event is KeyDownEvent && !event.repeat) {
+        if (event is KeyDownEvent) {
           plPlayerController.toggleVrEye();
         }
         return true;

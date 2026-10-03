@@ -168,17 +168,17 @@ void main() {
       name: 'Download',
       url: treeUri,
     );
-    final video = LocalMediaItem(
+    const video = LocalMediaItem(
       name: 'a.mkv',
       uri: '$treeUri/document/primary%3ADownload%2F%E7%94%B5%E5%BD%B1%2Fa.mkv',
       source: saf,
       remotePath: 'primary:Download/电影/a.mkv',
       size: 1,
     );
-    final directVideo = LocalMediaItem(
+    const directVideo = LocalMediaItem(
       name: 'b.mp4',
       uri: '/storage/emulated/0/Movies/b.mp4',
-      source: const LocalMediaSource(
+      source: LocalMediaSource(
         type: LocalMediaSourceType.device,
         name: '本机存储',
         url: '/storage/emulated/0',
@@ -191,7 +191,7 @@ void main() {
     });
 
     test('childPath: SAF 用文档 id, 直读用绝对路径', () {
-      final dir = LocalMediaItem(
+      const dir = LocalMediaItem(
         name: '电影',
         uri: '$treeUri/document/primary%3ADownload%2F%E7%94%B5%E5%BD%B1',
         source: saf,
@@ -228,7 +228,7 @@ void main() {
         username: 'user',
         password: 'secret',
       );
-      final smbItem = LocalMediaItem(
+      const smbItem = LocalMediaItem(
         name: 'c.mkv',
         uri: 'smb://user:secret@NAS/pub/c.mkv',
         source: smb,
@@ -248,7 +248,7 @@ void main() {
     });
 
     test('列表排序: 目录在前, SAF 条目一视同仁', () {
-      final dir = LocalMediaItem(
+      const dir = LocalMediaItem(
         name: 'zzz目录',
         uri: '$treeUri/document/primary%3Azzz',
         source: saf,

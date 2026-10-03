@@ -115,7 +115,16 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
             return
         }
         try {
-            if (!enterPictureInPictureMode()) {
+            // 必须用带 params 的重载: 无参版返回 void(Kotlin 里没法当布尔用),
+            // 而且显式进入时 params 里不能带 autoEnterEnabled(那是"用户离开时
+            // 自动进入"的开关, 两处都开会让系统拒掉这次调用)。
+            val params = buildPipParams(autoEnter = false)
+            if (params == null) {
+                notifyDart("onFailed", mapOf("reason" to "params=null"))
+                finish()
+                return
+            }
+            if (!enterPictureInPictureMode(params)) {
                 notifyDart("onFailed", mapOf("reason" to "enterPictureInPictureMode=false"))
                 finish()
             }
@@ -126,7 +135,15 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
     }
 
     private fun updatePipParams(autoEnter: Boolean) {
-        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+        val params = buildPipParams(autoEnter) ?: return
+        try {
+            setPictureInPictureParams(params)
+        } catch (e: Throwable) {
+        }
+    }
+
+    private fun buildPipParams(autoEnter: Boolean): PictureInPictureParams? {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return null
         val w = intent.getIntExtra(EXTRA_WIDTH, 16).coerceIn(1, 4096)
         val h = intent.getIntExtra(EXTRA_HEIGHT, 9).coerceIn(1, 4096)
         val builder = PictureInPictureParams.Builder().setAspectRatio(Rational(w, h))
@@ -144,10 +161,7 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
             }
         }
         addMediaActions(builder)
-        try {
-            setPictureInPictureParams(builder.build())
-        } catch (e: Throwable) {
-        }
+        return builder.build()
     }
 
     /** PiP 窗口的系统按钮: 快退 / 播放暂停 / 快进(与 AndroidHelper 同一套媒体键) */
@@ -160,11 +174,11 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
         } ?: return
         val actions = ArrayList<RemoteAction>(3)
         addAction(actions, mbr, R.drawable.ic_player_rewind_10s, "ACTION_REWIND",
-            PlaybackState.ACTION_REWIND)
+            PlaybackState.ACTION_REWIND.toInt())
         addAction(actions, mbr, R.drawable.ic_player_play, "ACTION_PLAY_PAUSE",
-            PlaybackState.ACTION_PLAY_PAUSE)
+            PlaybackState.ACTION_PLAY_PAUSE.toInt())
         addAction(actions, mbr, R.drawable.ic_player_fast_forward_10s, "ACTION_FAST_FORWARD",
-            PlaybackState.ACTION_FAST_FORWARD)
+            PlaybackState.ACTION_FAST_FORWARD.toInt())
         builder.setActions(actions)
     }
 

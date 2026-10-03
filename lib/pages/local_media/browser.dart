@@ -12,6 +12,7 @@ import 'package:PiliPlus/models/local_media/local_media_sort.dart';
 import 'package:PiliPlus/models/local_media/local_media_source.dart';
 import 'package:PiliPlus/pages/local_media/controller.dart';
 import 'package:PiliPlus/pages/local_media/widgets/smb_dialogs.dart';
+import 'package:PiliPlus/services/floating_player.dart';
 import 'package:PiliPlus/services/local_media_service.dart';
 import 'package:PiliPlus/services/saf/saf_bridge.dart';
 import 'package:PiliPlus/utils/cache_manager.dart';
@@ -71,6 +72,11 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
   void dispose() {
     _dlCancelled = true; // 页面都关了, 别让下载继续占着网络
     _dlDialogContext = null;
+    // 浏览页都关了, 这一页导出过的 SAF fd 没有再被使用的可能
+    // (小窗还活着时它自己会在关闭时收尾)
+    if (!FloatingPlayerService.instance.isActive) {
+      unawaited(SafFdRegistry.releaseAll());
+    }
     _searchDebounce?.cancel();
     _searchFlushTimer?.cancel();
     _searchGen++; // 让在飞的检索作废, 回调里会因 mounted/gen 不符而直接返回
@@ -256,8 +262,15 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
         setState(() => _syncProgress(_effectiveItems));
       }
       // SAF 条目播放时导出的 fd(视频本体 + 外挂字幕)一次性回收;
-      // Kotlin 侧另有 LRU 兜底, 但主动关掉才不会把句柄攒满
-      await SafFdRegistry.releaseAll();
+      // Kotlin 侧另有 LRU 兜底, 但主动关掉才不会把句柄攒满。
+      //
+      // **小窗播放时绝对不能关**: 应用内画中画是"播放页出栈、播放器保活",
+      // 于是这里的 await 会返回, 但 mpv 还拿着这些 fd 在读(关掉就是 EBADF,
+      // 表现为小窗画面卡死/报错)。回播放页走的也是同一个 fd, 所以整段
+      // 小窗生命周期内都要留着, 交给 FloatingPlayerService.close() 收尾。
+      if (!FloatingPlayerService.instance.isActive) {
+        await SafFdRegistry.releaseAll();
+      }
     } on Object catch (err) {
       SmartDialog.showToast('无法播放: $err');
     } finally {

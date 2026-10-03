@@ -5,6 +5,7 @@ import 'package:PiliPlus/models/common/video/source_type.dart';
 import 'package:PiliPlus/models/local_media/local_media_item.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
+import 'package:PiliPlus/services/saf/saf_bridge.dart' show SafFdRegistry;
 import 'package:PiliPlus/utils/local_media_progress.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/utils.dart';
@@ -169,6 +170,9 @@ class FloatingPlayerService {
       // 播放页早就出栈了, 销毁得由这里补上
       controller.dispose();
     }
+    // SAF 条目的 fd 在小窗期间是**故意留着**的(浏览页那边不能关, 见
+    // LocalMediaBrowserPage._play); 播放到此为止, 这里统一收尾。
+    unawaited(SafFdRegistry.releaseAll());
   }
 
   /// 打开新播放页之前先收掉旧的小窗(播放器是单例, 不能被两个页面抢)

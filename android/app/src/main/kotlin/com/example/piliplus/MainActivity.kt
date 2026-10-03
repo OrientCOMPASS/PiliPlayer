@@ -22,10 +22,14 @@ class MainActivity : AudioServiceActivity() {
 
     companion object {
         // content:// 导出的 fd -> 句柄。Dart 侧播放页退出后调 closeFd/closeAllFds
-        // 关闭; 兜底: 同时挂起的 fd 超过 MAX_OPEN_FDS 时按**打开顺序**关掉最旧的
-        // (防止异常路径泄漏)。上限从 4 提到 8: SAF 目录里播一个视频会同时挂上
-        // 视频本体与若干外挂字幕的 fd, 4 个太容易把正在用的挤掉。
-        private const val MAX_OPEN_FDS = 8
+        // 关闭; 兜底: 同时挂起的 fd 超过 MAX_OPEN_FDS 时按**打开顺序**(LinkedHashMap)
+        // 关掉最旧的, 防止异常路径泄漏。
+        //
+        // 上限从 4 提到 16: ① SAF 目录里播一个视频会同时挂上视频本体与若干
+        // 外挂字幕的 fd; ② 应用内画中画(小窗)期间会长期占着一个 fd, 而用户
+        // 还在应用里继续浏览/播放别的文件 —— 上限太小会把正在用的挤掉
+        // (mpv 拿到的是裸 fd, 句柄被关就是 EBADF)。
+        private const val MAX_OPEN_FDS = 16
 
         private val openFds = object : LinkedHashMap<Int, ParcelFileDescriptor>() {
             override fun removeEldestEntry(

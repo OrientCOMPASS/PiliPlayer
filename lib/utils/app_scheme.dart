@@ -23,6 +23,7 @@ import 'package:PiliPlus/pages/live/view.dart';
 import 'package:PiliPlus/pages/rank/view.dart';
 import 'package:PiliPlus/pages/subscription_detail/view.dart';
 import 'package:PiliPlus/pages/video/reply_reply/view.dart';
+import 'package:PiliPlus/services/floating_player.dart';
 import 'package:PiliPlus/utils/id_utils.dart';
 import 'package:PiliPlus/utils/page_utils.dart';
 import 'package:PiliPlus/utils/parse_string.dart';
@@ -289,8 +290,10 @@ abstract final class PiliScheme {
           },
         );
       } finally {
-        // 播放页退出即释放 fd(Kotlin 侧另有数量兜底)
-        if (fd != null) {
+        // 播放页退出即释放 fd(Kotlin 侧另有数量兜底)。
+        // 但**应用内画中画**是"播放页出栈、播放器保活", 此时 mpv 还拿着这个
+        // fd 在读, 关掉就是 EBADF; 小窗关闭时由 FloatingPlayerService 收尾。
+        if (fd != null && !FloatingPlayerService.instance.isActive) {
           try {
             await _sharedMediaChannel.invokeMethod('closeFd', {'fd': fd});
           } catch (_) {}

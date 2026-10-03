@@ -69,8 +69,13 @@ void main() {
     });
 
     test('半偏时角速度约为满偏的一半', () {
-      final half = GamepadMath.look(0.575, 0, 1.0);
-      expect(half.yaw, closeTo(GamepadMath.degPerSec * 0.5, 1e-9));
+      // 时间片要小于 maxDeltaSeconds, 否则先被夹取(那是上一条测试的事)
+      const dt = 0.2;
+      final half = GamepadMath.look(0.575, 0, dt);
+      final full = GamepadMath.look(1, 0, dt);
+      expect(half.yaw, closeTo(GamepadMath.degPerSec * dt * 0.5, 1e-9));
+      expect(full.yaw, closeTo(GamepadMath.degPerSec * dt, 1e-9));
+      expect(half.yaw, closeTo(full.yaw / 2, 1e-9));
     });
   });
 }

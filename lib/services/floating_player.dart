@@ -100,6 +100,8 @@ class FloatingPlayerService {
     }
     active.value = true;
     _startProgressSaver(controller, _restoreArgs);
+    // 播放页马上就要出栈, 它占的那份引用计数交给小窗(见方法注释)
+    controller.releasePageSlotForFloating();
 
     // 播放页出栈 —— 下面的页面立刻可见可点, 这就是"只收起播放页"
     final navigator = Navigator.maybeOf(context, rootNavigator: true);

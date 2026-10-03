@@ -212,6 +212,17 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 服务负责(关闭小窗)或交还给新的播放页(点小窗回播放页)。
   bool floatingKeepAlive = false;
 
+  /// 小窗接管播放器: 把播放页占的那一份引用计数还回来。
+  ///
+  /// 不减的话"播放页 -> 小窗 -> 回播放页"会让 `_playerCount` 变成 2, 用户
+  /// 第二次退出播放页时 dispose 只会把它减到 1 就返回, 播放器**不会被销毁**
+  /// (表现为退出播放页后声音还在、局域网还在拉流)。
+  void releasePageSlotForFloating() {
+    if (_playerCount > 0) {
+      _playerCount -= 1;
+    }
+  }
+
   late bool _isAutoEnterPip = false;
   bool get isAutoEnterPip => _isAutoEnterPip;
 

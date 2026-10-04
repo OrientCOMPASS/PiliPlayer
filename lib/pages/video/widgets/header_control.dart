@@ -39,6 +39,7 @@ import 'package:PiliPlus/pages/video/introduction/local_media/controller.dart';
 import 'package:PiliPlus/services/floating_player.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
+import 'package:PiliPlus/plugin/pl_player/models/pip_style.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/vr_projection.dart';
 import 'package:PiliPlus/services/shutdown_timer_service.dart'
@@ -371,7 +372,9 @@ class HeaderControlState extends State<HeaderControl>
     }
   }
 
-  /// 画中画(点按入口): 优先**系统** PiP(独立 Activity, 应用内可继续浏览);
+  /// 画中画(点按入口): 走「设置 → 播放设置 → 画中画样式」选的实现。
+  ///
+  /// 默认是**系统画中画(独立 PiP Activity)**: 系统级小窗 + 应用内可继续浏览。
   /// 这条路走不通(设备不支持/系统拒绝/surface 没起来)时依次退回
   /// ① 老的"整应用系统 PiP" ② 应用内浮窗 —— 保证按钮永远有反应。
   Future<void> enterPip(BuildContext context) async {
@@ -380,6 +383,30 @@ class HeaderControlState extends State<HeaderControl>
     final title = args['title']?.toString() ?? '正在播放';
     // context 只在同步阶段用一次(await 之后不再碰, 免得页面已销毁)
     final navigator = Navigator.maybeOf(context, rootNavigator: true);
+    switch (Pref.pipStyle) {
+      case PipStyle.inAppFloat:
+        service.enter(
+          navigator: navigator,
+          controller: plPlayerController,
+          title: title,
+          restoreArgs: args,
+        );
+        return;
+      case PipStyle.systemWholeApp:
+        if (AndroidHelper.isPipAvailable) {
+          plPlayerController.enterPip();
+        } else {
+          service.enter(
+            navigator: navigator,
+            controller: plPlayerController,
+            title: title,
+            restoreArgs: args,
+          );
+        }
+        return;
+      case PipStyle.systemWindow:
+        break;
+    }
     final ok = await service.enterSystemPip(
       navigator: navigator,
       controller: plPlayerController,
@@ -2351,7 +2378,10 @@ class HeaderControlState extends State<HeaderControl>
                     // PipActivity(moonlight-android 的同款结构), 主 Activity
                     // 留在原任务里, 所以 PiP 期间照样能逛应用; 播放器不重建,
                     // 不重新拉流。长按 = 应用内浮窗(不依赖系统 PiP 的备选)。
-                    tooltip: '系统画中画(可继续浏览应用)\n长按: 应用内小窗',
+                    tooltip:
+                        '画中画(${Pref.pipStyle.label})\n'
+                        '长按: 应用内浮窗\n'
+                        '样式可在 设置→播放设置→画中画样式 里改',
                     style: btnStyle,
                     onPressed: () => unawaited(enterPip(context)),
                     onLongPress: () => enterInAppPip(context),

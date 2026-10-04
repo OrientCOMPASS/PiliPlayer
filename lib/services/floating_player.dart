@@ -267,7 +267,63 @@ class FloatingPlayerService {
     _startProgressSaver(controller, _restoreArgs);
     controller.releasePageSlotForFloating();
     _popPage(navigator);
+    _scheduleHandoffWatchdog(controller, wasPlaying);
     return true;
+  }
+
+  /// 交接自检(第二十二轮)。
+  ///
+  /// "进 PiP 后被暂停 / 画面与黑屏来回闪 / 关窗闪退"这类问题只能在真机上
+  /// 复现, 所以这里自己验一遍: 2.5 秒后(三次 wid 补刀都跑完了)检查
+  ///   ① mpv 的渲染目标是否还是 PiP 窗口(被别人抢回去 = 窗口是黑的);
+  ///   ② 播放状态是否还是进 PiP 前的样子(被"退后台就暂停"停掉 = 画面冻住)。
+  /// 任一不满足就**自动退回应用内浮窗**(纯 Flutter, 不做 surface 交接),
+  /// 至少给用户一个能用的小窗, 并把原因写进 `[pip]` 日志。
+  void _scheduleHandoffWatchdog(
+    PlPlayerController controller,
+    bool wasPlaying,
+  ) {
+    Timer(const Duration(milliseconds: 2500), () {
+      if (!isSystemPip || _controller != controller) {
+        return; // 已经展开/关闭/换成别的模式了
+      }
+      final player = controller.videoPlayerController;
+      final wid = int.tryParse(MpvWidHandoff.read(player, 'wid') ?? '') ?? -1;
+      final playing = controller.playerStatus.isPlaying;
+      if (wid == _pipWid && (playing || !wasPlaying)) {
+        return; // 交接成功, 一切正常
+      }
+      logger.w(
+        '[pip] 自检未通过(wid=$wid 期望=$_pipWid, playing=$playing '
+        '期望=$wasPlaying) -> 自动退回应用内浮窗',
+      );
+      _fallbackToInAppWindow(controller, wasPlaying: wasPlaying);
+    });
+  }
+
+  /// 系统 PiP 交接不成功时的兜底: 画面还给 Flutter 纹理, 关掉 PiP 窗口,
+  /// 改用应用内浮窗(它只是把播放页出栈 + 在 root Overlay 上挂一个
+  /// `SimpleVideo`, 不碰 mpv 的渲染目标, 因此不依赖 ROM 的 surface 行为)。
+  void _fallbackToInAppWindow(
+    PlPlayerController controller, {
+    required bool wasPlaying,
+  }) {
+    _ignoreNativeEvents = true;
+    _restoreFlutterSurface(controller);
+    unawaited(SystemPipBridge.stop());
+    _mode = DetachedPlaybackMode.inAppWindow;
+    if (!_insertEntry()) {
+      close();
+      return;
+    }
+    if (wasPlaying && !controller.playerStatus.isPlaying) {
+      unawaited(controller.play());
+    }
+    SmartDialog.showToast(
+      '系统画中画在这台设备上没交接成功，已切到应用内浮窗\n'
+      '可在「设置 → 播放设置 → 画中画样式」里更换实现',
+      displayTime: const Duration(seconds: 4),
+    );
   }
 
   /// 关掉主 Activity 的"自动进系统 PiP"。

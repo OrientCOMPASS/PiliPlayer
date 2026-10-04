@@ -8,6 +8,7 @@ import 'package:PiliPlus/pages/setting/models/model.dart';
 import 'package:PiliPlus/pages/setting/pages/fullscreen_sc_size.dart';
 import 'package:PiliPlus/pages/setting/widgets/select_dialog.dart';
 import 'package:PiliPlus/pages/setting/widgets/slider_dialog.dart';
+import 'package:PiliPlus/plugin/pl_player/models/pip_style.dart';
 import 'package:PiliPlus/plugin/pl_player/models/bottom_progress_behavior.dart';
 import 'package:PiliPlus/plugin/pl_player/models/fullscreen_mode.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
@@ -234,6 +235,19 @@ List<SettingsModel> get playSettings => [
       leading: Icon(CustomIcons.dm_off),
       setKey: SettingBoxKey.pipNoDanmaku,
       defaultVal: false,
+    ),
+    // 顶栏「画中画」按钮点按时用哪种实现。做成可选是因为"系统 PiP + 应用内
+    // 可继续浏览"要把 mpv 的渲染目标在 Flutter 纹理与独立 PiP Activity 的
+    // SurfaceView 之间交接, 依赖厂商 ROM 的窗口/surface 行为, 真机差异大 ——
+    // 出问题时能自己切一种立刻可用的。长按画中画按钮始终是应用内浮窗。
+    PopupModel(
+      title: '画中画样式',
+      leading: const Icon(Icons.picture_in_picture_alt_outlined),
+      value: () => Pref.pipStyle,
+      items: PipStyle.values,
+      onSelected: (value, setState) => GStorage.setting
+          .put(SettingBoxKey.pipStyle, value.index)
+          .whenComplete(setState),
     ),
   ],
   const SwitchModel(

@@ -29,7 +29,6 @@ import 'package:PiliPlus/models/user/danmaku_rule.dart';
 import 'package:PiliPlus/models/user/info.dart';
 import 'package:PiliPlus/pages/setting/pages/fullscreen_sc_size.dart'
     show kFullScreenSCWidth;
-import 'package:PiliPlus/plugin/pl_player/models/pip_style.dart';
 import 'package:PiliPlus/plugin/pl_player/models/audio_output_type.dart';
 import 'package:PiliPlus/plugin/pl_player/models/bottom_progress_behavior.dart';
 import 'package:PiliPlus/plugin/pl_player/models/fullscreen_mode.dart';
@@ -829,22 +828,6 @@ abstract final class Pref {
 
   static bool get autoPiP =>
       _setting.get(SettingBoxKey.autoPiP, defaultValue: false);
-
-  /// 顶栏「画中画」按钮点按时用哪种实现(第二十二轮新增, 二十三轮改默认)。
-  ///
-  /// 默认 [PipStyle.systemWholeApp]: 由持有 Flutter 引擎的 Activity 自己进
-  /// 系统 PiP, 窗口里就是**整个播放页**, 且没有任何 surface 交接(最稳)。
-  /// 想"PiP 期间还能在应用内浏览"就切成 独立窗口 / 应用内浮窗, 取舍见
-  /// `PipStyle` 的类注释(单引擎同一时刻只渲染一个 Activity, 二者不可兼得)。
-  static PipStyle get pipStyle {
-    final index = _setting.get(SettingBoxKey.pipStyle);
-    if (index is int) {
-      if (PipStyle.values.elementAtOrNull(index) case final style?) {
-        return style;
-      }
-    }
-    return PipStyle.systemWholeApp;
-  }
 
   static bool get enableSponsorBlock =>
       _setting.get(SettingBoxKey.enableSponsorBlock, defaultValue: false);

@@ -205,24 +205,6 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   /// 之类的判断无需逐处改写(在安卓上始终走非 PiP 分支)。
   bool get isDesktopPip => false;
 
-  /// **应用内画中画(小窗)保活**标记 —— 见 `services/floating_player.dart`。
-  ///
-  /// 为 true 时播放页出栈**不销毁**播放器: 小窗还在用它渲染(root Overlay
-  /// 上的浮窗持有同一个 [VideoController]/mpv 实例), 最终的 dispose 由浮窗
-  /// 服务负责(关闭小窗)或交还给新的播放页(点小窗回播放页)。
-  bool floatingKeepAlive = false;
-
-  /// 小窗接管播放器: 把播放页占的那一份引用计数还回来。
-  ///
-  /// 不减的话"播放页 -> 小窗 -> 回播放页"会让 `_playerCount` 变成 2, 用户
-  /// 第二次退出播放页时 dispose 只会把它减到 1 就返回, 播放器**不会被销毁**
-  /// (表现为退出播放页后声音还在、局域网还在拉流)。
-  void releasePageSlotForFloating() {
-    if (_playerCount > 0) {
-      _playerCount -= 1;
-    }
-  }
-
   late bool _isAutoEnterPip = false;
   bool get isAutoEnterPip => _isAutoEnterPip;
 
@@ -515,11 +497,6 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
   }
 
   void _onUserLeaveHint() {
-    // 画面已经交给应用内小窗 / 独立 PiP Activity 时, 主 Activity 不要再
-    // 自己缩进系统 PiP(否则会出现两个小窗)
-    if (floatingKeepAlive) {
-      return;
-    }
     if (playerStatus.isPlaying && _isCurrVideoPage) {
       enterPip();
     }

@@ -331,13 +331,6 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
 
   @override
   void didChangeAppLifecycleState(AppLifecycleState state) {
-    // 画面正在往"应用内小窗 / 独立 PiP Activity"交接: 启动 PiP Activity 会让
-    // 主 Activity 短暂 onPause, Flutter 侧就收到 paused —— 这时按"退后台就暂停"
-    // 处理会把刚交出去的画面停在第一帧(真机实测: 一进画中画视频就暂停,
-    // 而播放页已经出栈、再没人来恢复它)。
-    if (plPlayerController.floatingKeepAlive) {
-      return;
-    }
     if (!plPlayerController.continuePlayInBackground.value) {
       late final player = plPlayerController.videoPlayerController;
       if (const <AppLifecycleState>[.paused, .detached].contains(state)) {

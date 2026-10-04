@@ -16,7 +16,6 @@ import android.view.MotionEvent
 import android.view.WindowManager.LayoutParams
 import com.ryanheise.audioservice.AudioServiceActivity
 import io.flutter.embedding.engine.FlutterEngine
-import io.flutter.plugin.common.BinaryMessenger
 import io.flutter.plugin.common.MethodChannel
 
 class MainActivity : AudioServiceActivity() {
@@ -26,9 +25,8 @@ class MainActivity : AudioServiceActivity() {
         // 关闭; 兜底: 同时挂起的 fd 超过 MAX_OPEN_FDS 时按**打开顺序**(LinkedHashMap)
         // 关掉最旧的, 防止异常路径泄漏。
         //
-        // 上限从 4 提到 16: ① SAF 目录里播一个视频会同时挂上视频本体与若干
-        // 外挂字幕的 fd; ② 应用内画中画(小窗)期间会长期占着一个 fd, 而用户
-        // 还在应用里继续浏览/播放别的文件 —— 上限太小会把正在用的挤掉
+        // 上限从 4 提到 16: SAF 目录里播一个视频会同时挂上视频本体与若干
+        // 外挂字幕的 fd, 上限太小会把正在用的挤掉
         // (mpv 拿到的是裸 fd, 句柄被关就是 EBADF)。
         private const val MAX_OPEN_FDS = 16
 
@@ -48,16 +46,6 @@ class MainActivity : AudioServiceActivity() {
         }
 
         private const val REQ_PICK_TREE = 0x5171
-
-        /**
-         * FlutterEngine 的 messenger, 给 PipActivity 用: 系统画中画跑在**独立
-         * Activity**里(见 PipActivity 头注释), 它没有自己的引擎, 但要把
-         * surface 就绪/展开/关闭这些事件送回同一个 Dart isolate。
-         */
-        // 注意: 不能写 `private set` —— 那样 setter 只在 companion 内部可见,
-        // configureFlutterEngine(外部类)就赋不了值了。
-        @Volatile
-        var dartMessenger: BinaryMessenger? = null
     }
 
     private var pendingTreePick: MethodChannel.Result? = null
@@ -79,7 +67,6 @@ class MainActivity : AudioServiceActivity() {
 
     override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
         super.configureFlutterEngine(flutterEngine)
-        dartMessenger = flutterEngine.dartExecutor.binaryMessenger
         MethodChannel(
             flutterEngine.dartExecutor.binaryMessenger,
             "piliplus/local_media"
@@ -220,34 +207,6 @@ class MainActivity : AudioServiceActivity() {
                 "safOpenAllFilesSettings" -> result.success(
                     SafBrowser.openAllFilesAccessSettings(this)
                 )
-
-                else -> result.notImplemented()
-            }
-        }
-
-        // 系统画中画(独立 PiP Activity, 见 PipActivity): Dart 侧只需要
-        // "起窗口 / 关窗口 / 窗口还在不在", surface 与 mpv 的 wid 交接由
-        // PipActivity 通过同一个通道反向推给 Dart。
-        MethodChannel(
-            flutterEngine.dartExecutor.binaryMessenger,
-            PipChannel.NAME
-        ).setMethodCallHandler { call, result ->
-            when (call.method) {
-                PipChannel.START -> result.success(
-                    PipLauncher.start(
-                        this,
-                        call.argument<Int>("width") ?: 16,
-                        call.argument<Int>("height") ?: 9,
-                        call.argument<String>("title")
-                    )
-                )
-
-                PipChannel.STOP -> {
-                    PipActivity.finishCurrent()
-                    result.success(true)
-                }
-
-                PipChannel.IS_ALIVE -> result.success(PipActivity.isAlive())
 
                 else -> result.notImplemented()
             }

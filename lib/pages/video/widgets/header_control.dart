@@ -1,4 +1,4 @@
-import 'dart:async' show Timer, unawaited;
+import 'dart:async' show Timer;
 import 'dart:convert' show jsonDecode, utf8;
 import 'dart:io' show Platform, File;
 import 'dart:typed_data' show Uint8List;
@@ -36,10 +36,8 @@ import 'package:PiliPlus/pages/video/introduction/ugc/widgets/action_item.dart';
 import 'package:PiliPlus/pages/video/introduction/ugc/widgets/menu_row.dart';
 import 'package:PiliPlus/pages/video/widgets/header_mixin.dart';
 import 'package:PiliPlus/pages/video/introduction/local_media/controller.dart';
-import 'package:PiliPlus/services/floating_player.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/data_source.dart';
-import 'package:PiliPlus/plugin/pl_player/models/pip_style.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_repeat.dart';
 import 'package:PiliPlus/plugin/pl_player/models/vr_projection.dart';
 import 'package:PiliPlus/services/shutdown_timer_service.dart'
@@ -370,75 +368,6 @@ class HeaderControlState extends State<HeaderControl>
     } else {
       introController = Get.find<PgcIntroController>(tag: heroTag);
     }
-  }
-
-  /// 画中画(点按入口): 走「设置 → 播放设置 → 画中画样式」选的实现。
-  ///
-  /// 默认是**整个播放页进系统 PiP**(由持有引擎的 Activity 自己进 PiP,
-  /// 窗口里就是播放页, 没有任何 surface 交接); 想要"PiP 期间还能在应用内
-  /// 浏览"就选 独立窗口 / 应用内浮窗。
-  /// 独立窗口那条路走不通(设备不支持/系统拒绝/surface 没起来)时依次退回
-  /// ① 整应用系统 PiP ② 应用内浮窗 —— 保证按钮永远有反应。
-  Future<void> enterPip(BuildContext context) async {
-    final service = FloatingPlayerService.instance;
-    final args = videoDetailCtr.args;
-    final title = args['title']?.toString() ?? '正在播放';
-    // context 只在同步阶段用一次(await 之后不再碰, 免得页面已销毁)
-    final navigator = Navigator.maybeOf(context, rootNavigator: true);
-    switch (Pref.pipStyle) {
-      case PipStyle.inAppFloat:
-        service.enter(
-          navigator: navigator,
-          controller: plPlayerController,
-          title: title,
-          restoreArgs: args,
-        );
-        return;
-      case PipStyle.systemWholeApp:
-        if (AndroidHelper.isPipAvailable) {
-          plPlayerController.enterPip();
-        } else {
-          service.enter(
-            navigator: navigator,
-            controller: plPlayerController,
-            title: title,
-            restoreArgs: args,
-          );
-        }
-        return;
-      case PipStyle.systemWindow:
-        break;
-    }
-    final ok = await service.enterSystemPip(
-      navigator: navigator,
-      controller: plPlayerController,
-      title: title,
-      restoreArgs: args,
-    );
-    if (ok) {
-      return;
-    }
-    if (AndroidHelper.isPipAvailable) {
-      plPlayerController.enterPip();
-      return;
-    }
-    service.enter(
-      navigator: navigator,
-      controller: plPlayerController,
-      title: title,
-      restoreArgs: args,
-    );
-  }
-
-  /// 应用内浮窗(长按入口): 不出系统 PiP, 纯 Flutter 层的 root Overlay 小窗
-  void enterInAppPip(BuildContext context) {
-    final args = videoDetailCtr.args;
-    FloatingPlayerService.instance.enter(
-      navigator: Navigator.maybeOf(context, rootNavigator: true),
-      controller: plPlayerController,
-      title: args['title']?.toString() ?? '正在播放',
-      restoreArgs: args,
-    );
   }
 
   /// 设置面板
@@ -2376,16 +2305,13 @@ class HeaderControlState extends State<HeaderControl>
                   width: btnWidth,
                   height: btnHeight,
                   child: IconButton(
-                    // 点按 = 按「设置 → 播放设置 → 画中画样式」所选的实现进入
-                    // 画中画(默认: 整个播放页进系统 PiP, 无 surface 交接);
-                    // 长按 = 应用内浮窗(任何时候都可用的兜底)。
-                    tooltip:
-                        '画中画(${Pref.pipStyle.label})\n'
-                        '长按: 应用内浮窗\n'
-                        '样式可在 设置→播放设置→画中画样式 里改',
+                    tooltip: '画中画',
                     style: btnStyle,
-                    onPressed: () => unawaited(enterPip(context)),
-                    onLongPress: () => enterInAppPip(context),
+                    onPressed: () {
+                      if (AndroidHelper.isPipAvailable) {
+                        plPlayerController.enterPip();
+                      }
+                    },
                     icon: const Icon(
                       Icons.picture_in_picture_outlined,
                       size: 19,

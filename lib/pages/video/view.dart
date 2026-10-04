@@ -361,19 +361,7 @@ class _VideoDetailPageVState extends State<VideoDetailPageV>
       showSystemBar();
     }
 
-    final playerCtr = videoDetailController.plPlayerController;
-    if (playerCtr.floatingKeepAlive) {
-      // 应用内画中画(第十九轮 需求3): 页面出栈但播放器要活着继续在浮窗里播。
-      //   * 心跳照常上报(这次播放该算进历史);
-      //   * 媒体会话簿记与正常退出一致地摘掉本页那一条(否则小窗关掉之后
-      //     通知栏会残留一个已经不存在的页面);
-      //   * 播放回调指向的是**本页**的闭包(里面用着已销毁的 controller),
-      //     必须清掉, 回到播放页时会重新设上;
-      //   * 播放器本体由 FloatingPlayerService 负责后续销毁/交还。
-      videoPlayerServiceHandler?.onVideoDetailDispose(heroTag);
-      videoDetailController.makeHeartBeat();
-      PlPlayerController.setPlayCallBack(null);
-    } else if (!playerCtr.isCloseAll) {
+    if (!videoDetailController.plPlayerController.isCloseAll) {
       videoPlayerServiceHandler?.onVideoDetailDispose(heroTag);
       if (plPlayerController != null) {
         videoDetailController.makeHeartBeat();

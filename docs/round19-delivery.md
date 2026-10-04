@@ -1,5 +1,10 @@
 # 第十九轮交付说明 + 装机测试清单
 
+> **⚠️ 第二十五轮起本文的「画中画」章节全部作废**：应用内浮窗、独立 PiP Activity、
+> 「画中画样式」设置等实现已整体回退到上游原版（见 `docs/round25-delivery.md`）。
+> 本文仅作决策记录保留，其中非画中画的部分（SAF 浏览、播放列表、播放/字幕记忆、
+> 手柄、VR）仍然有效。
+
 > 面向真机验证。所有改动都已在 CI（`PiliPlayer CI`）里跑通
 > `flutter analyze`（错误 0）、新增代码零容忍检查（`dart analyze --fatal-infos`，
 > STRICT_PATHS 全绿）、`flutter test`（全部单测通过）与

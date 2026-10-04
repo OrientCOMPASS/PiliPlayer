@@ -410,17 +410,8 @@ class VideoDetailController extends GetxController
   /// 位置记忆仍走 [LocalMediaProgress]。见 `utils/local_media_memory.dart`。
   LocalMediaSettings? _localMemory;
 
-  /// 本地/局域网媒体: 播放地址来自文件系统或 URL, 全程不请求 B 站接口。
-  ///
-  /// [startAt] 优先于本机续播记录: 应用内画中画(小窗)回到播放页时带的是
-  /// "小窗里看到的实时位置", 而本机记录是 5 秒一存且**小窗期间不再更新**
-  /// (进度监听随播放页一起销毁了), 不优先用它就会出现"在小窗里看了半小时,
-  /// 回播放页跳回半小时前"。
-  void initLocalMediaSource(
-    LocalMediaItem item, {
-    String? playUrl,
-    Duration? startAt,
-  }) {
+  /// 本地/局域网媒体: 播放地址来自文件系统或 URL, 全程不请求 B 站接口
+  void initLocalMediaSource(LocalMediaItem item, {String? playUrl}) {
     localItem = item;
     localPlayUrl = playUrl ?? LocalMediaService.playbackUrl(item);
     // fd:// (系统分享打开)的地址每次会话都不同, 记不住也不该记
@@ -433,8 +424,8 @@ class VideoDetailController extends GetxController
       quality: VideoQuality.fluent360,
     );
     data = PlayUrlModel(timeLength: null);
-    // 续播位置: 调用方给的实时位置优先, 否则用本机记录
-    defaultST = startAt ?? LocalMediaProgress.get(item.uri);
+    // 续播位置来自本机记录
+    defaultST = LocalMediaProgress.get(item.uri);
     _lastLocalProgressSavedMs = 0;
     _setVideoHeight();
   }
@@ -646,15 +637,10 @@ class VideoDetailController extends GetxController
       // 那里挂的是**在线视频**的顶栏菜单(分享/举报/稍后再看...), 对本地文件
       // 全都不成立。本地点开就是要看, 没有"先不播"的语义。
       _autoPlay.value = true;
-      final startMs = args['progress'];
       initLocalMediaSource(
         args['localMedia'] as LocalMediaItem,
         // SMB 之类需要先在本机代理上注册, 由「本地」板块解析好后传进来
         playUrl: args['localPlayUrl'] as String?,
-        // 应用内画中画回到播放页时带的实时进度(见 initLocalMediaSource)
-        startAt: startMs is int && startMs > 0
-            ? Duration(milliseconds: startMs)
-            : null,
       );
       // 周期性落盘续播进度: 只靠 onClose 保存并不可靠
       // (进程被杀、后台回收、播放器先于控制器销毁都会丢进度)

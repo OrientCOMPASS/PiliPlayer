@@ -39,12 +39,12 @@ r24 只改了**默认值**：`Pref.pipStyle` 从 `systemWindow` 改成 `systemWh
    → `PageUtils.enterPip(...)` → JNI `AndroidHelper.enterPip(engineId, width, height, autoEnter, isLive, isPlaying)`，由**持有 Flutter 引擎的那个 Activity（MainActivity）自己进系统 PiP**。没有第二个 Activity、没有 surface/wid 交接。
 2. **窗口里是什么**：整个播放页。`lib/pages/video/view.dart` 里那段
    `if (plPlayerController.isPipMode) { child = plPlayer(..., isPipMode: true); }`
-   是**原版就有的**（本轮未动），所以控件层/弹幕/VR 层都在小窗里；`画中画不显示弹幕`（`pipNoDanmaku`）继续生效。
-3. **自动画中画**：「设置 → 播放设置 → 自动画中画」(`autoPiP`) 仍是原版逻辑——`_onUserLeaveHint()` 里 `playerStatus.isPlaying && _isCurrVideoPage` 时进 PiP，不再有 `floatingKeepAlive` 短路。
+   是**原版就有的**（本轮未动），所以控件层/弹幕/VR 层都在小窗里；`画中画不加载弹幕`（`pipNoDanmaku`）继续生效。
+3. **后台画中画**：「设置 → 播放设置 → 后台画中画」(`autoPiP`) 仍是原版逻辑——`_onUserLeaveHint()` 里 `playerStatus.isPlaying && _isCurrVideoPage` 时进 PiP，不再有 `floatingKeepAlive` 短路。
 4. **叉号 / 展开**：点叉号 = 退出整个应用（整应用 PiP 的标准行为）；点展开 = 回到应用、播放页原样还在、进度连续。
 5. **长按画中画按钮**：不再有额外行为（应用内浮窗已删）。
 6. **直播间**的画中画入口（`lib/pages/live_room/widgets/header_control.dart`）本来就是原版，未动。
-7. **设置页**：「画中画样式」选项已移除，播放设置里只剩原版的「自动画中画」「画中画不显示弹幕」。
+7. **设置页**：「画中画样式」选项已移除，播放设置里只剩原版的「后台画中画」「画中画不加载弹幕」。
 
 ---
 
@@ -102,8 +102,8 @@ r24 只改了**默认值**：`Pref.pipStyle` 从 `systemWindow` 改成 `systemWh
 3. 小窗里点「叉号」→ 应用退出（这是整应用 PiP 的标准行为，不是 bug）。
 4. 小窗期间拖动/缩放窗口、旋转设备 → 画面跟随，不出现黑块。
 5. 小窗期间按系统媒体键（耳机线控/蓝牙）→ 播放暂停生效。
-6. 「设置 → 播放设置 → 自动画中画」打开后，播放中按 Home → 自动进 PiP；关掉后按 Home → 不进。
-7. 「画中画不显示弹幕」开关在小窗里生效。
+6. 「设置 → 播放设置 → 后台画中画」打开后，播放中按 Home → 自动进 PiP；关掉后按 Home → 不进。
+7. 「画中画不加载弹幕」开关在小窗里生效。
 8. VR/全景片源进小窗 → VR 渲染仍在（小窗里是整页，含 VR 层与读数条）；不应再出现 r21~r23 那种黑屏/闪烁/叉号闪退。
 9. 直播间的画中画按钮可用（原版入口）。
 10. 「设置 → 播放设置」里**没有**「画中画样式」这一项。
@@ -115,3 +115,18 @@ r24 只改了**默认值**：`Pref.pipStyle` 从 `systemWindow` 改成 `systemWh
 13. 播放列表：表头计数 + 检索框仍 pinned 在顶部，切集自动滚到正在播那条。
 14. 手柄：右摇杆环视、△ 摆正、□ 眼位、× 播放暂停、L1/R1 进退 60s 均正常。
 15. 「关于」页 commit hash 应等于 r25 的提交（tag `v2.1.5-r25`）。
+
+---
+
+## 6. 产物静态校验（沙盒侧，装机前先自查了一遍）
+
+- `app-arm64-v8a-release.apk` **24,337,738 B**（r24 是 24,360,971 B，小了约 23 KB ≈ 删掉的 PiP 代码），
+  sha256 `48097bbe67ee08d9c7565ec0193ad7fd629050d75e717bba290def2b51d67af6`，只含 `lib/arm64-v8a`。
+- `classes.dex`：`PipActivity` / `PipChannel` / `PipLauncher` / `piliplus/pip` **命中 0**；
+  原版 `enterPip` / `isPipAvailable` / `isPipMode` 仍在；SAF（`piliplus/local_media`、`safPickTree`）
+  与手柄（`piliplus/gamepad`）通道仍在。
+- `libapp.so`（Dart AOT 快照里中文是 UTF-16LE，按该编码搜）：「画中画样式」「系统独立窗口」
+  「整应用系统 PiP」「应用内浮窗」「`[pip]`」**全部 0 命中**；原版「后台画中画」
+  「进入后台时以小窗形式（PiP）播放」「画中画不加载弹幕」「画中画」(tooltip) 仍在；
+  其它轮次功能串（检索 / 续播 / 倍速 / VR 操作模式 / 播放列表 / 本机文件夹）仍在。
+- CI：check（`flutter analyze` + 严格 `dart analyze --fatal-infos` + `flutter test`）与 release 构建全绿。

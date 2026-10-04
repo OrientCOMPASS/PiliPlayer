@@ -31,14 +31,28 @@ enum SystemPipEventType {
 }
 
 class SystemPipEvent {
-  const SystemPipEvent(this.type, {this.wid = 0, this.reason});
+  const SystemPipEvent(
+    this.type, {
+    this.wid = 0,
+    this.width = 0,
+    this.height = 0,
+    this.reason,
+  });
 
   final SystemPipEventType type;
 
   /// native 侧 `MediaKitAndroidHelper.newGlobalObjectRef(surface)` 的返回值:
   /// 指向 android.view.Surface 的 JNI 全局引用指针, 也就是 mpv `--wid` 的值
   final int wid;
+
+  /// PiP 窗口的像素尺寸(TextureView 的 SurfaceTexture 已按它设好默认缓冲尺寸,
+  /// mpv 的 `android-surface-size` 要跟它一致)
+  final int width;
+  final int height;
   final String? reason;
+
+  /// `android-surface-size` 的值; 尺寸未知时返回 null(不改动该选项)
+  String? get surfaceSize => width > 0 && height > 0 ? '${width}x$height' : null;
 
   bool get inPip => wid == 1;
 
@@ -46,6 +60,11 @@ class SystemPipEvent {
     final args = call.arguments;
     int widOf() {
       final value = args is Map ? args['wid'] : null;
+      return value is int ? value : (value is num ? value.toInt() : 0);
+    }
+
+    int sizeOf(String key) {
+      final value = args is Map ? args[key] : null;
       return value is int ? value : (value is num ? value.toInt() : 0);
     }
 
@@ -58,10 +77,14 @@ class SystemPipEvent {
       'onSurfaceReady' => SystemPipEvent(
         SystemPipEventType.surfaceReady,
         wid: widOf(),
+        width: sizeOf('width'),
+        height: sizeOf('height'),
       ),
       'onSurfaceChanged' => SystemPipEvent(
         SystemPipEventType.surfaceChanged,
         wid: widOf(),
+        width: sizeOf('width'),
+        height: sizeOf('height'),
       ),
       'onSurfaceLost' => SystemPipEvent(
         SystemPipEventType.surfaceLost,

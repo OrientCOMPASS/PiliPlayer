@@ -5,15 +5,14 @@ import android.app.PictureInPictureParams
 import android.app.RemoteAction
 import android.content.Intent
 import android.content.res.Configuration
+import android.graphics.SurfaceTexture
 import android.graphics.drawable.Icon
 import android.media.session.PlaybackState
 import android.os.Build
 import android.os.Bundle
-import android.os.Handler
-import android.os.Looper
 import android.util.Rational
-import android.view.SurfaceHolder
-import android.view.SurfaceView
+import android.view.Surface
+import android.view.TextureView
 import android.view.WindowManager
 import android.widget.FrameLayout
 import com.alexmercerind.mediakitandroidhelper.MediaKitAndroidHelper
@@ -30,35 +29,39 @@ import io.flutter.plugin.common.MethodChannel
  * excludeFromRecents + noHistory), 主界面 `PcView` 是另一个 Activity。
  * 这里照搬同一套结构。
  *
- * 画面怎么过来: Flutter 是单 Activity/单引擎, 视频由 mpv 渲染进 media_kit 在
- * Flutter 纹理注册表里创建的 Surface。所以进 PiP 时把 mpv 的 `--wid`
- * (一个指向 android.view.Surface 的 JNI 全局引用指针, 见 media_kit 的
- * VideoOutput.createSurface)改指到**本 Activity 的 SurfaceView**, 按 media_kit
- * 自己的顺序做 `vo=null -> wid=<新> -> vo=gpu`; 退出 PiP 再指回原来那个。
+ * 画面怎么过来: Flutter 是单 Activity/单引擎, 视频由 mpv 渲染进 media_kit
+ * 创建的 Surface。所以进 PiP 时把 mpv 的 `--wid`(一个指向 android.view.Surface
+ * 的 JNI 全局引用指针, 见 media_kit 的 VideoOutput.createSurface)改指到
+ * **本 Activity 的 TextureView**, 按 media_kit 自己的顺序做
+ * `vo=null -> wid=<新> -> vo=gpu`; 退出 PiP 再指回原来那个。
  * 播放器实例全程不重建: 不重新拉流、不丢进度、不重新缓冲。
+ *
+ * 用 TextureView 而不是 SurfaceView(第二十二轮真机反馈后的改动):
+ * SurfaceView 是"在窗口上打洞"+独立图层, 进 PiP 的那段动画里窗口会被
+ * 反复 resize/reparent, 系统会**销毁并重建它的 surface** —— 每次销毁我们都要
+ * 阻塞等 Dart 把 mpv 摘下来(黑), 重建后再挂回去(画面), 于是真机上就是
+ * "画面与黑屏来回闪烁"。TextureView 的 SurfaceTexture 只在 view 被移除时才销毁,
+ * 窗口 resize/动画期间一直有效; 而且 SurfaceTexture 包出来的 Surface 正是
+ * media_kit 喂给这个定制 libmpv 的同一种东西(它那边也是 SurfaceTexture),
+ * 所以渲染路径是已验证过的。
  *
  * 与 Dart 的通信走 `piliplus/pip` 通道(同一个 FlutterEngine 的 messenger,
  * 由 MainActivity 缓存): 本 Activity 把 surface 就绪/失效、展开、关闭等事件
  * 推给 Dart, Dart 反过来调 start/stop。
  */
-class PipActivity : Activity(), SurfaceHolder.Callback {
+class PipActivity : Activity(), TextureView.SurfaceTextureListener {
 
     companion object {
         const val EXTRA_WIDTH = "width"
         const val EXTRA_HEIGHT = "height"
         const val EXTRA_TITLE = "title"
 
-        /** surfaceDestroyed 里等 Dart 把 mpv 从这个 surface 上摘下来的时间。
-         *  回调返回之后 surface 随时失效, 继续往里渲染就是 use-after-free;
-         *  Dart 在 UI isolate 上跑(不依赖主线程), 所以短暂阻塞主线程是安全的。
-         *  真机实测(第二十一轮): 点 PiP 窗口的叉号会闪退 —— 因为通知当时是
-         *  mainHandler.post 出去的, 而 onStop -> surfaceDestroyed -> onDestroy
-         *  是同一次主线程调用序列, post 的消息要等这一串跑完才发得出去,
-         *  Dart 收到"surface 没了"的时候 mpv 还在往已销毁的窗口渲染。
-         *  改成**同步 invokeMethod**(本来就在主线程), 再等这么久才返回。 */
-        // 200ms: Dart 侧摘除只要几毫秒(vo=null/wid=0 是同步 FFI), 留这么长是
-        //  为了 Dart 线程正忙(掉帧/构建中)时也来得及; 再长就会让 PiP 尺寸
-        //  变化引起的 surface 重建期间黑屏更久。
+        /** surface 失效时等 Dart 把 mpv 摘下来的时间。
+         *  回调返回之后这块 surface 随时会被回收, 继续往里渲染就是
+         *  use-after-free(第二十一轮真机: 点 PiP 窗口叉号 -> app 闪退)。
+         *  通知是**同步** invokeMethod 出去的(见 notifyDart), Dart 在 UI isolate
+         *  上处理、setOption 是直连 FFI, 都不需要主线程, 所以这里阻塞主线程
+         *  等它是安全的。200ms: Dart 侧摘除只要几毫秒, 留这么长是防它正忙。 */
         private const val DETACH_WAIT_MS = 200L
 
         @Volatile
@@ -75,7 +78,12 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
         fun isAlive(): Boolean = instance != null
     }
 
+    /** 当前交给 mpv 的 Surface(由 TextureView 的 SurfaceTexture 包出来) */
+    private var surface: Surface? = null
+
+    /** 它对应的 JNI 全局引用指针, 也就是 mpv `--wid` 的值; 0 = 无 */
     private var wid: Long = 0
+
     private var inPip = false
     private var pipRequested = false
 
@@ -85,18 +93,18 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
     /** 已经通知过 Dart"窗口被关掉了" */
     private var closedNotified = false
 
-    private lateinit var surfaceView: SurfaceView
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private lateinit var textureView: TextureView
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         instance = this
-        surfaceView = SurfaceView(this)
-        surfaceView.holder.addCallback(this)
+        textureView = TextureView(this)
+        textureView.surfaceTextureListener = this
+        textureView.isOpaque = true
         val root = FrameLayout(this)
         root.setBackgroundColor(0xFF000000.toInt())
         root.addView(
-            surfaceView,
+            textureView,
             FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT,
                 FrameLayout.LayoutParams.MATCH_PARENT
@@ -109,11 +117,10 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
     override fun onResume() {
         super.onResume()
         // autoEnter=false: 这个 Activity 是"生来就要进 PiP"的, 由 enterPipNow()
-        // 显式进入; 同时开 autoEnter 会让系统再触发一次进入, 窗口来回重建
-        // (真机上的画面/黑屏闪烁嫌疑之一)。展开之后才打开 autoEnter(见
-        // onPictureInPictureModeChanged), 那样按 Home 能重新缩回小窗。
+        // 显式进入; 同时开 autoEnter 会让系统再触发一次进入, 窗口来回重建。
+        // 展开之后才打开 autoEnter(见 onPictureInPictureModeChanged), 那样按
+        // Home 能重新缩回小窗。
         updatePipParams(autoEnter = false)
-        // 这个 Activity 生来就是为了当 PiP 窗口的: 一可见就进 PiP
         if (!pipRequested) {
             pipRequested = true
             enterPipNow()
@@ -128,8 +135,7 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
         }
         try {
             // 必须用带 params 的重载: 无参版返回 void(Kotlin 里没法当布尔用),
-            // 而且显式进入时 params 里不能带 autoEnterEnabled(那是"用户离开时
-            // 自动进入"的开关, 两处都开会让系统拒掉这次调用)。
+            // 而且显式进入时 params 里不能带 autoEnterEnabled。
             val params = buildPipParams(autoEnter = false)
             if (params == null) {
                 notifyDart("onFailed", mapOf("reason" to "params=null"))
@@ -220,41 +226,78 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
         }
     }
 
-    // ==================== Surface: mpv 的渲染目标 ====================
+    // ==================== 渲染目标: mpv 的 --wid ====================
 
-    override fun surfaceCreated(holder: SurfaceHolder) {
-        releaseWid()
+    override fun onSurfaceTextureAvailable(st: SurfaceTexture, width: Int, height: Int) {
+        // SurfaceTexture 的默认缓冲尺寸是 1x1, 不显式设的话 mpv 只会渲染一个像素
+        // (media_kit 那边也是这么做的)。这里按**窗口尺寸**设: 小窗不需要片源
+        // 那么大的缓冲, 省显存也省带宽。
+        try {
+            st.setDefaultBufferSize(width, height)
+        } catch (e: Throwable) {
+        }
+        val newSurface = try {
+            Surface(st)
+        } catch (e: Throwable) {
+            null
+        }
+        if (newSurface == null) {
+            notifyDart("onFailed", mapOf("reason" to "Surface(st)=null"))
+            return
+        }
+        // 万一上一块 surface 还挂着(理论上不会: 中间必有 destroyed), 先摘掉
+        if (wid != 0L) {
+            notifyDart("onSurfaceLost", mapOf("wid" to wid))
+            sleepForDetach()
+            releaseSurface()
+        }
+        surface = newSurface
         wid = try {
-            MediaKitAndroidHelper.newGlobalObjectRef(holder.surface)
+            MediaKitAndroidHelper.newGlobalObjectRef(newSurface)
         } catch (e: Throwable) {
             0L
         }
-        // 首次 = 交接; 之后(PiP 尺寸变化导致 surface 重建) = 重新交接
-        notifyDart("onSurfaceReady", mapOf("wid" to wid))
+        notifyDart(
+            "onSurfaceReady",
+            mapOf("wid" to wid, "width" to width, "height" to height)
+        )
     }
 
-    override fun surfaceChanged(holder: SurfaceHolder, format: Int, width: Int, height: Int) {
-        // 窗口尺寸变化: vo=gpu 自己会跟着窗口重配, 这里只把尺寸告诉 Dart 备查
+    override fun onSurfaceTextureSizeChanged(st: SurfaceTexture, width: Int, height: Int) {
+        // PiP 窗口被拖动/缩放: TextureView 的 SurfaceTexture 不会因此重建,
+        // 只要把缓冲尺寸跟上(wid 不变, 不需要重新交接)
+        try {
+            st.setDefaultBufferSize(width, height)
+        } catch (e: Throwable) {
+        }
         notifyDart(
             "onSurfaceChanged",
             mapOf("wid" to wid, "width" to width, "height" to height)
         )
     }
 
-    override fun surfaceDestroyed(holder: SurfaceHolder) {
-        // 同步通知 Dart: vo=null / wid=0, 让 mpv 立刻停止往这个 surface 渲染
+    override fun onSurfaceTextureDestroyed(st: SurfaceTexture): Boolean {
+        // 同步通知 Dart 摘除, 然后等它落下去(见 DETACH_WAIT_MS 注释)
         notifyDart("onSurfaceLost", mapOf("wid" to wid))
+        sleepForDetach()
+        releaseSurface()
+        // 返回 true: SurfaceTexture 由我们释放
+        return true
+    }
+
+    override fun onSurfaceTextureUpdated(st: SurfaceTexture) {
+        // 每帧都会回调, 什么都不做
+    }
+
+    private fun sleepForDetach() {
         try {
-            // 等 Dart 处理完(见 DETACH_WAIT_MS 注释); 返回之后这个 surface 就
-            // 随时可能被系统回收
             Thread.sleep(DETACH_WAIT_MS)
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
         }
-        releaseWid()
     }
 
-    private fun releaseWid() {
+    private fun releaseSurface() {
         val old = wid
         wid = 0
         if (old != 0L) {
@@ -263,6 +306,11 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
             } catch (e: Throwable) {
             }
         }
+        try {
+            surface?.release()
+        } catch (e: Throwable) {
+        }
+        surface = null
     }
 
     // ==================== PiP 生命周期 ====================
@@ -297,7 +345,7 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
             closedNotified = true
             notifyDart("onClosed", null)
         }
-        releaseWid()
+        releaseSurface()
         if (instance === this) {
             instance = null
         }
@@ -306,7 +354,7 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onUserLeaveHint() {
         super.onUserLeaveHint()
-        // 从 PiP 展开态按 Home: 再收回去(与主 Activity 的自动画中画一致)
+        // 从展开态按 Home: 再收回去(与主 Activity 的自动画中画一致)
         if (!inPip && !isFinishing) {
             enterPipNow()
         }
@@ -316,9 +364,9 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
 
     /**
      * 给 Dart 发事件。**必须同步发**, 不能 post 到主线程队列:
-     * surfaceDestroyed / onStop / onDestroy 是同一次主线程调用序列, post 出去
-     * 的消息要等这一串全部跑完才会被派发, 那时 surface 早已失效(真机上表现为
-     * 点 PiP 窗口的叉号 -> mpv 往死窗口渲染 -> 闪退)。
+     * onStop -> surfaceDestroyed -> onDestroy 是同一次主线程调用序列, post 出去
+     * 的消息要等这一串全部跑完才会被派发, 那时 surface 早已失效(第二十一轮
+     * 真机: 点 PiP 窗口的叉号 -> mpv 往死窗口渲染 -> 闪退)。
      * 这些回调本身就在主线程, 直接 invokeMethod 即可(消息投递到 Dart 的 UI
      * 线程, 不需要主线程继续转)。
      */

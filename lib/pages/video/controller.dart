@@ -525,12 +525,17 @@ class VideoDetailController extends GetxController
     // 字幕: 取 mpv **实际生效**的那条(不是我们记的索引), 面板上显示什么
     // 就记什么; 播放器刚起来还没选好轨时 id 为空, 这时不写(保持默认策略)
     final track = ctr.currentTrack.value.subtitle;
+    final trackId = track.id;
+    // SubtitleTrack.title 是可空的(内嵌轨常常没有标题)
+    final trackTitle = track.title;
     LocalMediaMemory.put(
       uri,
       LocalMediaSettings(
         speed: (speed - Pref.playSpeedDefault).abs() > 0.01 ? speed : null,
-        subtitleId: track.id.isEmpty ? null : track.id,
-        subtitleTitle: track.title.isEmpty ? null : track.title,
+        subtitleId: trackId.isEmpty ? null : trackId,
+        subtitleTitle: trackTitle == null || trackTitle.isEmpty
+            ? null
+            : trackTitle,
         vrProjection: vrOn
             ? ctr.vrProjection.value
             : ctr.vrUserTouched

@@ -1025,7 +1025,8 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     // auto 解析前按平面播放(解析结果出来才切 VR, 见 _maybeResolveVrAuto)
     vrProjection.value =
         requested == VrProjection.auto ? VrProjection.off : requested;
-    _vrTarget = const VrViewState(fov: Pref.vrDefaultFov);
+    // 不能 const: Pref.vrDefaultFov 是读盒子的运行时值
+    _vrTarget = VrViewState(fov: Pref.vrDefaultFov);
     vrView.value = _vrTarget;
     _vrFrameScheduled = false;
     _vrLastFrameStamp = null;
@@ -1470,6 +1471,9 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
           current.fov != target.fov) {
         vrView.value = target; // 收尾对齐, 不留 0.005° 的尾巴
       }
+      // 收敛后停表: 下次再有输入时 dt 从 1/60 起算, 不会因为"上次收敛
+      // 到现在过了很久"而算出一个巨大的 dt(alpha≈1)让第一帧直接跳到位
+      _vrLastFrameStamp = null;
       return true;
     }
     final alpha = 1 - exp(-dtSeconds * 1000 / vrSmoothTauMs);

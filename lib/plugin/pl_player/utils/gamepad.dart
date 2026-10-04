@@ -117,29 +117,25 @@ abstract final class GamepadBridge {
   };
 }
 
-/// 摇杆采样器: VR 操作模式挂一个, 只负责"把最新读数取回来"。
+/// 轮询器: VR 操作模式挂一个, 把右摇杆读数按固定节奏喂给回调。
 ///
-/// 第二十轮 需求6 的关键分工: **采样与积分解耦**。
-/// 旧实现是"取到一次读数就推进一次视角", 于是角度只在采样到达的那一刻动
-/// (50Hz, 还要再过一层 30ms 节流 ≈ 33Hz), 而陀螺仪是 native 逐帧跑的 ——
-/// 真机上手柄环视就是一格一格的。现在采样只管刷新缓存, 推进由
-/// `VrControlLayer` 的帧 Ticker 每帧用最新采样 × 真实帧间隔来积分,
-/// 更新率与屏幕刷新率一致。
+/// 单独抽出来是为了让 `VrControlLayer` 的 build/dispose 保持干净, 也方便
+/// 在测试里替换节奏。
 class GamepadPoller {
   GamepadPoller({
-    this.interval = const Duration(milliseconds: 10),
-    required this.onSample,
+    this.interval = const Duration(milliseconds: 20),
+    required this.onAxes,
   });
 
-  /// 采样间隔。10ms(≈100Hz)主要是为了压低"手柄动了但 Dart 还不知道"的延迟;
-  /// 平滑度由帧积分保证, 不靠这个频率。
+  /// 采样间隔。20ms(≈50Hz)足够跟手, 又不会把主线程塞满
   final Duration interval;
 
-  /// 拿到**新鲜**读数时回调(rightX, rightY); 陈旧/静止不回调
-  final void Function(double rightX, double rightY) onSample;
+  /// 每次拿到**新鲜**读数时回调(rightX, rightY, 距上次采样的秒数)
+  final void Function(double rightX, double rightY, double dtSeconds) onAxes;
 
   Timer? _timer;
   bool _busy = false;
+  int _lastMs = 0;
 
   bool get isRunning => _timer != null;
 
@@ -147,6 +143,7 @@ class GamepadPoller {
     if (_timer != null || !GamepadBridge.isSupported) {
       return;
     }
+    _lastMs = DateTime.now().millisecondsSinceEpoch;
     _timer = Timer.periodic(interval, (_) => unawaited(_tick()));
   }
 
@@ -158,7 +155,7 @@ class GamepadPoller {
   }
 
   Future<void> _tick() async {
-    // 上一次通道调用还没回来就跳过: 宁可掉一次采样, 也不要让请求排队
+    // 上一帧的通道调用还没回来就跳过: 宁可掉一帧, 也不要让请求排队
     // (排队会造成"松手之后视角还在飘")
     if (_busy) {
       return;
@@ -166,10 +163,13 @@ class GamepadPoller {
     _busy = true;
     try {
       final axes = await GamepadBridge.read();
+      final now = DateTime.now().millisecondsSinceEpoch;
+      final dt = (now - _lastMs) / 1000.0;
+      _lastMs = now;
       if (_timer == null || axes.stale) {
         return;
       }
-      onSample(axes.rightX, axes.rightY);
+      onAxes(axes.rightX, axes.rightY, dt);
     } finally {
       _busy = false;
     }
@@ -189,7 +189,7 @@ abstract final class GamepadMath {
   /// 满偏时的角速度(度/秒)。360° 片源约 3.3 秒转一圈, 跟手又不至于晕
   static const double degPerSec = 110.0;
 
-  /// 单次积分的最大时间片: 掉帧/切后台回来时不要让视角"瞬移"
+  /// 单次采样的最大时间片: 掉帧/切后台回来时不要让视角"瞬移"
   static const double maxDeltaSeconds = 0.25;
 
   /// 死区 + 线性重映射: 刚过死区时增量从 0 平滑起步, 不会一跳一大步
@@ -205,10 +205,7 @@ abstract final class GamepadMath {
     return value < 0 ? -scaled : scaled;
   }
 
-  /// 一次积分转成的角度增量(度)。静止(两轴都在死区内)返回 (0, 0)。
-  ///
-  /// [dtSeconds] 现在由 VrControlLayer 的帧 Ticker 给出(真实帧间隔),
-  /// 所以 60/90/120Hz 的屏幕上转速一致, 不会因刷新率不同而变快变慢。
+  /// 一次采样转成的角度增量(度)。静止(两轴都在死区内)返回 (0, 0)。
   static ({double yaw, double pitch}) look(
     double axisX,
     double axisY,

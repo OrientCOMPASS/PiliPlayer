@@ -1,4 +1,4 @@
-import 'dart:async' show Completer, StreamSubscription, Timer, unawaited;
+import 'dart:async' show Completer, Timer, unawaited;
 import 'dart:io' show Platform;
 
 import 'package:PiliPlus/models/common/video/source_type.dart';
@@ -14,7 +14,6 @@ import 'package:PiliPlus/utils/utils.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
-import 'package:media_kit/media_kit.dart' show Player;
 import 'package:media_kit_video/media_kit_video.dart' show SimpleVideo;
 import 'package:screen_brightness_platform_interface/screen_brightness_platform_interface.dart';
 
@@ -79,17 +78,19 @@ class FloatingPlayerService {
   /// PiP 窗口 SurfaceView 的 wid(mpv `--wid` 的值)
   int _pipWid = 0;
 
-  /// 交接前 Flutter 纹理那边的 wid / vo, 退出 PiP 时要还原回去
+  /// 交接前 Flutter 纹理那边的 wid / vo / surface 尺寸, 退出 PiP 时要还原回去
   int _flutterWid = 0;
   String _flutterVo = 'gpu';
+  String _flutterSurfaceSize = '0x0';
+
+  /// 交接后补刀的定时器(见 [_scheduleReassert])
+  final List<Timer> _reassertTimers = [];
 
   /// 等 PiP Activity 的 surface 就绪
   Completer<int>? _surfaceWaiter;
 
   /// Dart 主动收尾(展开/关闭)期间, 忽略 native 再推来的事件
   bool _ignoreNativeEvents = false;
-
-  StreamSubscription<dynamic>? _videoParamsSub;
 
   bool get isActive => active.value;
 
@@ -170,9 +171,19 @@ class FloatingPlayerService {
     // 交接前必须记住 Flutter 纹理那边的 wid, 否则退出 PiP 时回不去
     final flutterWid = int.tryParse(MpvWidHandoff.read(player, 'wid') ?? '') ?? 0;
     final flutterVo = MpvWidHandoff.read(player, 'vo') ?? 'gpu';
+    // media_kit 会把 android-surface-size 设成片源尺寸(它的 SurfaceTexture
+    // 需要这个); 交给 PiP 的 SurfaceView 时要还原成 0x0(= 跟随窗口),
+    // 否则等于让系统把 4K 缓冲塞进一个小窗(闪烁/黑屏嫌疑之一)
+    final flutterSurfaceSize =
+        MpvWidHandoff.read(player, 'android-surface-size') ?? '0x0';
     if (flutterWid <= 0) {
       return false;
     }
+    // **在启动 PiP Activity 之前**就置上保活标记: 启动会让主 Activity 短暂
+    // onPause -> Flutter 收到 paused -> 播放页那句"退后台就暂停"会把视频停掉,
+    // 而播放页随后就出栈了, 再没人来恢复它(真机实测: 一进画中画就暂停)。
+    controller.floatingKeepAlive = true;
+    final wasPlaying = controller.playerStatus.isPlaying;
 
     // 注意: 静态成员不能写成级联(`SystemPipBridge..installHandler()` 会被
     // 解析成对 Type 对象调实例方法)
@@ -203,6 +214,7 @@ class FloatingPlayerService {
       title: title,
     )) {
       _surfaceWaiter = null;
+      controller.floatingKeepAlive = false;
       return false;
     }
     final pipWid = await waiter.future.timeout(
@@ -211,6 +223,7 @@ class FloatingPlayerService {
     );
     _surfaceWaiter = null;
     if (pipWid <= 0) {
+      controller.floatingKeepAlive = false;
       unawaited(SystemPipBridge.stop());
       return false;
     }
@@ -222,12 +235,18 @@ class FloatingPlayerService {
     _restoreRoute = restoreRoute;
     _flutterWid = flutterWid;
     _flutterVo = flutterVo;
+    _flutterSurfaceSize = flutterSurfaceSize;
     _pipWid = pipWid;
-    controller.floatingKeepAlive = true;
 
-    // 画面搬进 PiP 窗口
-    MpvWidHandoff.attach(player, pipWid, vo: flutterVo);
-    _watchVideoParams(player);
+    // 画面搬进 PiP 窗口(surface 尺寸交回系统按窗口决定)
+    MpvWidHandoff.attach(player, pipWid, vo: flutterVo, surfaceSize: '0x0');
+    _scheduleReassert();
+    // 启动 PiP Activity 期间主 Activity 会短暂 onPause, 播放可能被"退后台
+    // 就暂停"停掉(那时保活标记还没生效或页面还没出栈), 这里按进 PiP 前的
+    // 状态补一次
+    if (wasPlaying && !controller.playerStatus.isPlaying) {
+      unawaited(controller.play());
+    }
 
     _leaveFullScreen(controller);
     _resetBrightness();
@@ -294,6 +313,22 @@ class FloatingPlayerService {
   // ==================== 系统画中画的事件与 surface 交接 ====================
 
   void _onPipEvent(SystemPipEvent event) {
+    try {
+      _handlePipEvent(event);
+    } catch (_) {
+      // 事件处理里出任何异常都不能让 native 侧等不到回应/让 mpv 挂在死窗口上
+    }
+  }
+
+  void _handlePipEvent(SystemPipEvent event) {
+    // surface 要没了: **无条件**先把 mpv 摘下来(native 正在主线程上等着我们,
+    // 摘晚了就是往已销毁的窗口渲染 -> 闪退)。这一步不受 _ignoreNativeEvents
+    // 影响: 摘除永远是安全的。
+    if (event.type == SystemPipEventType.surfaceLost) {
+      MpvWidHandoff.detach(_controller?.videoPlayerController);
+      _cancelReassert();
+      return;
+    }
     if (_ignoreNativeEvents) {
       return;
     }
@@ -306,13 +341,16 @@ class FloatingPlayerService {
           return;
         }
         // PiP 窗口尺寸变化会让系统重建 surface: 用新 wid 重新接上
-        if (isSystemPip && event.wid > 0) {
+        if (isSystemPip && event.wid > 0 && event.wid != _pipWid) {
           _pipWid = event.wid;
-          MpvWidHandoff.attach(player, event.wid, vo: _flutterVo);
+          MpvWidHandoff.attach(
+            player,
+            event.wid,
+            vo: _flutterVo,
+            surfaceSize: '0x0',
+          );
+          _scheduleReassert();
         }
-      case SystemPipEventType.surfaceLost:
-        // surface 马上失效, 先把 mpv 摘下来(native 侧会等我们 ~260ms)
-        MpvWidHandoff.detach(player);
       case SystemPipEventType.expanded:
         // 用户点了 PiP 窗口的"展开": 交还播放页
         unawaited(restore());
@@ -326,40 +364,65 @@ class FloatingPlayerService {
         }
       case SystemPipEventType.surfaceChanged:
       case SystemPipEventType.pipModeChanged:
+      case SystemPipEventType.surfaceLost:
       case SystemPipEventType.unknown:
         break;
     }
   }
 
-  /// media_kit 的 AndroidVideoController 在 videoParams 变化时会把 `wid`
-  /// 抢回它自己的 Flutter surface(它并不知道画面被借走了)。PiP 期间跟着补一刀
-  /// 把画面夺回来, 否则片源中途改分辨率会让 PiP 窗口黑屏。
-  void _watchVideoParams(Player player) {
-    _videoParamsSub?.cancel();
-    _videoParamsSub = player.stream.videoParams.listen((_) {
-      if (!isSystemPip || _pipWid <= 0) {
-        return;
-      }
-      final wid = _pipWid;
-      final vo = _flutterVo;
-      // 让 media_kit 那个(注册得更早的)listener 先跑完
-      Timer(const Duration(milliseconds: 150), () {
-        if (isSystemPip && _pipWid == wid) {
-          MpvWidHandoff.attach(_controller?.videoPlayerController, wid, vo: vo);
-        }
-      });
-    });
+  /// 有限次"补刀": media_kit 的 AndroidVideoController 在 videoParams 变化时
+  /// 会把 `wid` 抢回它自己的 Flutter 纹理(它不知道画面被借走了), 那样 PiP 窗口
+  /// 就黑了。
+  ///
+  /// 上一轮的做法是**监听 videoParams 事件后重新下发**, 结果真机上画面与黑屏
+  /// 来回闪烁 —— 我们自己那次 `vo=null -> vo=gpu` 又会引发新的事件, 两边互相
+  /// 触发成了正反馈。改成: 只在交接后的几个固定时间点**检查一次**, 发现 wid
+  /// 不在我们手里才重新接上(幂等, 不构成回路)。
+  void _scheduleReassert() {
+    _cancelReassert();
+    for (final delay in const [
+      Duration(milliseconds: 200),
+      Duration(milliseconds: 800),
+      Duration(seconds: 2),
+    ]) {
+      _reassertTimers.add(Timer(delay, _reassertPipSurface));
+    }
+  }
+
+  void _cancelReassert() {
+    for (final timer in _reassertTimers) {
+      timer.cancel();
+    }
+    _reassertTimers.clear();
+  }
+
+  void _reassertPipSurface() {
+    final player = _controller?.videoPlayerController;
+    if (player == null || !isSystemPip || _pipWid <= 0) {
+      return;
+    }
+    final current = int.tryParse(MpvWidHandoff.read(player, 'wid') ?? '') ?? 0;
+    if (current == _pipWid) {
+      return; // 还在我们手里, 不动它(每次重接都会黑一下, 能不动就不动)
+    }
+    MpvWidHandoff.attach(
+      player,
+      _pipWid,
+      vo: _flutterVo,
+      surfaceSize: '0x0',
+    );
   }
 
   /// 把画面还给 Flutter 纹理(退出系统画中画)
   void _restoreFlutterSurface(PlPlayerController controller) {
-    _videoParamsSub?.cancel();
-    _videoParamsSub = null;
+    _cancelReassert();
     if (_flutterWid > 0) {
       MpvWidHandoff.attach(
         controller.videoPlayerController,
         _flutterWid,
         vo: _flutterVo,
+        // 还原成 media_kit 当初设的片源尺寸(它的 SurfaceTexture 需要这个)
+        surfaceSize: _flutterSurfaceSize,
       );
     }
     _pipWid = 0;
@@ -412,8 +475,7 @@ class FloatingPlayerService {
       _ignoreNativeEvents = true;
       // 先从 PiP 的 surface 上摘下来再销毁, 免得 mpv 往已销毁的窗口渲染
       MpvWidHandoff.detach(controller?.videoPlayerController);
-      _videoParamsSub?.cancel();
-      _videoParamsSub = null;
+      _cancelReassert();
       _pipWid = 0;
       _flutterWid = 0;
       unawaited(SystemPipBridge.stop());

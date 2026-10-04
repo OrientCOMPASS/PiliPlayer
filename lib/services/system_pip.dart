@@ -159,16 +159,29 @@ abstract final class MpvWidHandoff {
     }
   }
 
-  /// 把画面接到 [wid] 指向的 surface 上
-  static void attach(Player? player, int wid, {String vo = 'gpu'}) {
+  /// 把画面接到 [wid] 指向的 surface 上。
+  ///
+  /// [surfaceSize] 对应 mpv 的 `android-surface-size`: media_kit 会把它设成
+  /// 片源尺寸(它那边是 SurfaceTexture, 必须显式给缓冲尺寸)。接到 PiP 的
+  /// SurfaceView 时要传 `0x0`(= 跟随窗口大小), 否则等于让系统把 4K 缓冲
+  /// 塞进一个小窗; 交还给 Flutter 纹理时再把原值还原回去。
+  static void attach(
+    Player? player,
+    int wid, {
+    String vo = 'gpu',
+    String? surfaceSize,
+  }) {
     if (player == null || wid <= 0) {
       return;
     }
     _safe(player, () {
       player
         ..setOption('vo', 'null')
-        ..setOption('wid', '$wid')
-        ..setOption('vo', vo);
+        ..setOption('wid', '$wid');
+      if (surfaceSize != null) {
+        player.setOption('android-surface-size', surfaceSize);
+      }
+      player.setOption('vo', vo);
     });
   }
 

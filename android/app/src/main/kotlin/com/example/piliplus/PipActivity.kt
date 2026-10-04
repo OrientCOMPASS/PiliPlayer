@@ -50,8 +50,16 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
 
         /** surfaceDestroyed 里等 Dart 把 mpv 从这个 surface 上摘下来的时间。
          *  回调返回之后 surface 随时失效, 继续往里渲染就是 use-after-free;
-         *  Dart 在 UI isolate 上跑(不依赖主线程), 所以短暂阻塞主线程是安全的。 */
-        private const val DETACH_WAIT_MS = 260L
+         *  Dart 在 UI isolate 上跑(不依赖主线程), 所以短暂阻塞主线程是安全的。
+         *  真机实测(第二十一轮): 点 PiP 窗口的叉号会闪退 —— 因为通知当时是
+         *  mainHandler.post 出去的, 而 onStop -> surfaceDestroyed -> onDestroy
+         *  是同一次主线程调用序列, post 的消息要等这一串跑完才发得出去,
+         *  Dart 收到"surface 没了"的时候 mpv 还在往已销毁的窗口渲染。
+         *  改成**同步 invokeMethod**(本来就在主线程), 再等这么久才返回。 */
+        // 200ms: Dart 侧摘除只要几毫秒(vo=null/wid=0 是同步 FFI), 留这么长是
+        //  为了 Dart 线程正忙(掉帧/构建中)时也来得及; 再长就会让 PiP 尺寸
+        //  变化引起的 surface 重建期间黑屏更久。
+        private const val DETACH_WAIT_MS = 200L
 
         @Volatile
         private var instance: PipActivity? = null
@@ -100,7 +108,11 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
 
     override fun onResume() {
         super.onResume()
-        updatePipParams(autoEnter = true)
+        // autoEnter=false: 这个 Activity 是"生来就要进 PiP"的, 由 enterPipNow()
+        // 显式进入; 同时开 autoEnter 会让系统再触发一次进入, 窗口来回重建
+        // (真机上的画面/黑屏闪烁嫌疑之一)。展开之后才打开 autoEnter(见
+        // onPictureInPictureModeChanged), 那样按 Home 能重新缩回小窗。
+        updatePipParams(autoEnter = false)
         // 这个 Activity 生来就是为了当 PiP 窗口的: 一可见就进 PiP
         if (!pipRequested) {
             pipRequested = true
@@ -230,9 +242,11 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
     }
 
     override fun surfaceDestroyed(holder: SurfaceHolder) {
+        // 同步通知 Dart: vo=null / wid=0, 让 mpv 立刻停止往这个 surface 渲染
         notifyDart("onSurfaceLost", mapOf("wid" to wid))
         try {
-            // 等 Dart 把 mpv 摘下来(见 DETACH_WAIT_MS 注释)
+            // 等 Dart 处理完(见 DETACH_WAIT_MS 注释); 返回之后这个 surface 就
+            // 随时可能被系统回收
             Thread.sleep(DETACH_WAIT_MS)
         } catch (e: InterruptedException) {
             Thread.currentThread().interrupt()
@@ -300,14 +314,20 @@ class PipActivity : Activity(), SurfaceHolder.Callback {
 
     // ==================== 与 Dart 通信 ====================
 
+    /**
+     * 给 Dart 发事件。**必须同步发**, 不能 post 到主线程队列:
+     * surfaceDestroyed / onStop / onDestroy 是同一次主线程调用序列, post 出去
+     * 的消息要等这一串全部跑完才会被派发, 那时 surface 早已失效(真机上表现为
+     * 点 PiP 窗口的叉号 -> mpv 往死窗口渲染 -> 闪退)。
+     * 这些回调本身就在主线程, 直接 invokeMethod 即可(消息投递到 Dart 的 UI
+     * 线程, 不需要主线程继续转)。
+     */
     private fun notifyDart(method: String, args: Map<String, Any>?) {
         val messenger = MainActivity.dartMessenger ?: return
-        mainHandler.post {
-            try {
-                MethodChannel(messenger, PipChannel.NAME).invokeMethod(method, args)
-            } catch (e: Throwable) {
-                // 引擎已销毁(应用被杀)之类: PiP 窗口自己收尾即可
-            }
+        try {
+            MethodChannel(messenger, PipChannel.NAME).invokeMethod(method, args)
+        } catch (e: Throwable) {
+            // 引擎已销毁(应用被杀)之类: PiP 窗口自己收尾即可
         }
     }
 }

@@ -17,6 +17,9 @@ class PlayerFocus extends StatelessWidget {
   /// 手柄 L1/R1 的单次快退/快进步长
   static const Duration kShoulderSeek = Duration(seconds: 60);
 
+  /// 十字键上/下单次音量步长: 1%(第二十六轮 需求1, 原为 10%)
+  static const double kVolumeStep = 0.01;
+
   const PlayerFocus({
     super.key,
     required this.child,
@@ -66,9 +69,9 @@ class PlayerFocus extends StatelessWidget {
     final volume = isIncrease
         ? math.min(
             plPlayerController.maxVolume,
-            plPlayerController.volume.value + 0.1,
+            plPlayerController.volume.value + kVolumeStep,
           )
-        : math.max(0.0, plPlayerController.volume.value - 0.1);
+        : math.max(0.0, plPlayerController.volume.value - kVolumeStep);
     plPlayerController.setVolume(volume);
   }
 
@@ -115,6 +118,22 @@ class PlayerFocus extends StatelessWidget {
         }
         return true;
       }
+    }
+
+    // 播放器页方块键(□, 安卓 KEYCODE_BUTTON_X -> gameButtonX, Xbox 手柄的
+    // X 键): 非 VR 操作模式下切换全屏, 与 F 键同一动作(第二十六轮 需求2)。
+    // VR 操作模式下已被上面的分支吃掉(切换眼位), 到不了这里, 天然屏蔽。
+    if (key == LogicalKeyboardKey.gameButtonX) {
+      if (event is KeyDownEvent && hasPlayer) {
+        final isFullScreen = this.isFullScreen;
+        if (isFullScreen && plPlayerController.controlsLock.value) {
+          plPlayerController
+            ..controlsLock.value = false
+            ..showControls.value = false;
+        }
+        plPlayerController.triggerFullScreen(status: !isFullScreen);
+      }
+      return true;
     }
 
     // DS/DualShock 手柄的 × 键(安卓 KEYCODE_BUTTON_A -> gameButtonA,

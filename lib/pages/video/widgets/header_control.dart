@@ -374,9 +374,11 @@ class HeaderControlState extends State<HeaderControl>
 
   /// 画中画(点按入口): 走「设置 → 播放设置 → 画中画样式」选的实现。
   ///
-  /// 默认是**系统画中画(独立 PiP Activity)**: 系统级小窗 + 应用内可继续浏览。
-  /// 这条路走不通(设备不支持/系统拒绝/surface 没起来)时依次退回
-  /// ① 老的"整应用系统 PiP" ② 应用内浮窗 —— 保证按钮永远有反应。
+  /// 默认是**整个播放页进系统 PiP**(由持有引擎的 Activity 自己进 PiP,
+  /// 窗口里就是播放页, 没有任何 surface 交接); 想要"PiP 期间还能在应用内
+  /// 浏览"就选 独立窗口 / 应用内浮窗。
+  /// 独立窗口那条路走不通(设备不支持/系统拒绝/surface 没起来)时依次退回
+  /// ① 整应用系统 PiP ② 应用内浮窗 —— 保证按钮永远有反应。
   Future<void> enterPip(BuildContext context) async {
     final service = FloatingPlayerService.instance;
     final args = videoDetailCtr.args;
@@ -2374,10 +2376,9 @@ class HeaderControlState extends State<HeaderControl>
                   width: btnWidth,
                   height: btnHeight,
                   child: IconButton(
-                    // 第二十轮 需求2: 点按 = **系统**画中画。画面交给独立的
-                    // PipActivity(moonlight-android 的同款结构), 主 Activity
-                    // 留在原任务里, 所以 PiP 期间照样能逛应用; 播放器不重建,
-                    // 不重新拉流。长按 = 应用内浮窗(不依赖系统 PiP 的备选)。
+                    // 点按 = 按「设置 → 播放设置 → 画中画样式」所选的实现进入
+                    // 画中画(默认: 整个播放页进系统 PiP, 无 surface 交接);
+                    // 长按 = 应用内浮窗(任何时候都可用的兜底)。
                     tooltip:
                         '画中画(${Pref.pipStyle.label})\n'
                         '长按: 应用内浮窗\n'

@@ -2,6 +2,7 @@ import 'dart:async' show Completer, Timer, unawaited;
 import 'dart:io' show Platform;
 
 import 'package:PiliPlus/models/common/video/source_type.dart';
+import 'package:PiliPlus/services/logger.dart';
 import 'package:PiliPlus/models/local_media/local_media_item.dart';
 import 'package:PiliPlus/plugin/pl_player/controller.dart';
 import 'package:PiliPlus/plugin/pl_player/models/play_status.dart';
@@ -166,6 +167,7 @@ class FloatingPlayerService {
     }
     final player = controller.videoPlayerController;
     if (player == null || controller.videoController == null) {
+      logger.w('[pip] 进入失败: 播放器/视频控制器还没就绪');
       return false;
     }
     // 交接前必须记住 Flutter 纹理那边的 wid, 否则退出 PiP 时回不去
@@ -176,7 +178,12 @@ class FloatingPlayerService {
     // 否则等于让系统把 4K 缓冲塞进一个小窗(闪烁/黑屏嫌疑之一)
     final flutterSurfaceSize =
         MpvWidHandoff.read(player, 'android-surface-size') ?? '0x0';
+    logger.w(
+      '[pip] 交接前: flutterWid=$flutterWid vo=$flutterVo '
+      'surfaceSize=$flutterSurfaceSize',
+    );
     if (flutterWid <= 0) {
+      logger.w('[pip] 进入失败: 读不到当前 wid(mpv 还没挂上 Flutter 纹理?)');
       return false;
     }
     // **在启动 PiP Activity 之前**就置上保活标记: 启动会让主 Activity 短暂
@@ -213,6 +220,7 @@ class FloatingPlayerService {
       height: ratioH,
       title: title,
     )) {
+      logger.w('[pip] 进入失败: 启动 PipActivity 被拒');
       _surfaceWaiter = null;
       controller.floatingKeepAlive = false;
       return false;
@@ -223,10 +231,12 @@ class FloatingPlayerService {
     );
     _surfaceWaiter = null;
     if (pipWid <= 0) {
+      logger.w('[pip] 进入失败: 4 秒内没等到 PiP 的 surface(或系统拒绝进入)');
       controller.floatingKeepAlive = false;
       unawaited(SystemPipBridge.stop());
       return false;
     }
+    logger.w('[pip] 拿到 PiP surface: wid=$pipWid, wasPlaying=$wasPlaying');
 
     _mode = DetachedPlaybackMode.systemPip;
     _controller = controller;
@@ -240,6 +250,7 @@ class FloatingPlayerService {
 
     // 画面搬进 PiP 窗口(surface 尺寸交回系统按窗口决定)
     MpvWidHandoff.attach(player, pipWid, vo: flutterVo, surfaceSize: '0x0');
+    logger.w('[pip] 已把 mpv 渲染目标交给 PiP 窗口');
     _scheduleReassert();
     // 启动 PiP Activity 期间主 Activity 会短暂 onPause, 播放可能被"退后台
     // 就暂停"停掉(那时保活标记还没生效或页面还没出栈), 这里按进 PiP 前的
@@ -313,10 +324,16 @@ class FloatingPlayerService {
   // ==================== 系统画中画的事件与 surface 交接 ====================
 
   void _onPipEvent(SystemPipEvent event) {
+    logger.w(
+      '[pip] 事件 ${event.type.name}'
+      '${event.wid == 0 ? '' : ' wid=${event.wid}'}'
+      '${event.reason == null ? '' : ' reason=${event.reason}'}',
+    );
     try {
       _handlePipEvent(event);
-    } catch (_) {
+    } catch (err) {
       // 事件处理里出任何异常都不能让 native 侧等不到回应/让 mpv 挂在死窗口上
+      logger.e('[pip] 事件处理异常', error: err);
     }
   }
 
@@ -405,6 +422,7 @@ class FloatingPlayerService {
     if (current == _pipWid) {
       return; // 还在我们手里, 不动它(每次重接都会黑一下, 能不动就不动)
     }
+    logger.w('[pip] wid 被抢走(当前 $current, 应为 $_pipWid), 重新接回');
     MpvWidHandoff.attach(
       player,
       _pipWid,
@@ -441,6 +459,7 @@ class FloatingPlayerService {
     final cid = args['cid'];
     final route = _restoreRoute;
     if (isSystemPip) {
+      logger.w('[pip] 展开: 画面交还 Flutter 纹理 wid=$_flutterWid');
       // 接下来 finish PiP 窗口时 native 还会推 onClosed/onSurfaceLost 过来,
       // 那是我们自己发起的收尾, 不能再当成"用户关掉了窗口"去销毁播放器
       _ignoreNativeEvents = true;
@@ -472,6 +491,7 @@ class FloatingPlayerService {
   void close() {
     final controller = _controller;
     if (isSystemPip) {
+      logger.w('[pip] 关闭: 先摘 surface 再销毁播放器');
       _ignoreNativeEvents = true;
       // 先从 PiP 的 surface 上摘下来再销毁, 免得 mpv 往已销毁的窗口渲染
       MpvWidHandoff.detach(controller?.videoPlayerController);

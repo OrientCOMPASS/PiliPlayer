@@ -94,6 +94,47 @@ void main() {
     });
   });
 
+  group('字幕记忆(第二十轮 需求2)', () {
+    test('轨道号 + 标题往返', () {
+      const settings = LocalMediaSettings(
+        subtitleId: '2',
+        subtitleTitle: 'movie.zh-CN.srt',
+      );
+      final restored = LocalMediaSettings.fromEncoded(
+        jsonEncode(settings.toJson()),
+      );
+      expect(restored!.hasSubtitle, isTrue);
+      expect(restored.subtitleId, '2');
+      expect(restored.subtitleTitle, 'movie.zh-CN.srt');
+      // 只记字幕也算"有记忆", 不会被当成空设置删掉
+      expect(restored.isEmpty, isFalse);
+    });
+
+    test('关闭字幕(no)与自动(auto)也要能记住', () {
+      for (final id in const ['no', 'auto']) {
+        final restored = LocalMediaSettings.fromEncoded(
+          jsonEncode(const LocalMediaSettings().toJson()..['sid'] = id),
+        );
+        expect(restored!.subtitleId, id);
+        expect(restored.hasSubtitle, isTrue);
+      }
+    });
+
+    test('没有字幕轨(id 为空)时不写', () {
+      const settings = LocalMediaSettings(subtitleId: null, subtitleTitle: null);
+      expect(settings.hasSubtitle, isFalse);
+      expect(settings.toJson().containsKey('sid'), isFalse);
+      expect(settings.isEmpty, isTrue);
+    });
+
+    test('标题为空时只留轨道号', () {
+      const settings = LocalMediaSettings(subtitleId: '1', subtitleTitle: '');
+      final json = settings.toJson();
+      expect(json['sid'], '1');
+      expect(json.containsKey('stitle'), isFalse);
+    });
+  });
+
   group('keyOf', () {
     test('同一 uri 稳定同键, 不同 uri 不同键', () {
       expect(

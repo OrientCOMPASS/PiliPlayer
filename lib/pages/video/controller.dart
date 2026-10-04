@@ -466,6 +466,46 @@ class VideoDetailController extends GetxController
     }
   }
 
+  /// 外置字幕自动加载 -> 恢复上次记住的字幕轨
+  Future<void> _autoloadLocalSubtitlesThenRestore() async {
+    await _autoloadLocalSubtitles();
+    if (isClosed) {
+      return;
+    }
+    await restoreRememberedSubtitle();
+  }
+
+  /// 恢复上次这个视频用的字幕轨(第二十轮 需求2)。
+  ///
+  /// 优先按**标题**找(外置字幕的标题就是文件名, 比轨道号稳 —— 轨道号会随
+  /// 内嵌轨数量漂移); 找不到再按轨道号; 都找不到就什么都不做, 宁可回到默认
+  /// 策略也不要因为记错而没字幕。
+  Future<void> restoreRememberedSubtitle() async {
+    final memory = _localMemory;
+    if (!isLocalMedia || memory == null || !memory.hasSubtitle) {
+      return;
+    }
+    final id = memory.subtitleId!;
+    final ctr = plPlayerController;
+    if (id == 'no' || id == 'auto') {
+      await ctr.selectInternalSubtitleById(id);
+      return;
+    }
+    final title = memory.subtitleTitle;
+    if (title != null && title.isNotEmpty) {
+      final selected = await ctr.selectSubtitleByTitle(
+        title,
+        timeout: const Duration(seconds: 2),
+      );
+      if (selected || isClosed) {
+        return;
+      }
+    }
+    if (ctr.internalSubtitleTracks.any((t) => t.id == id)) {
+      await ctr.selectInternalSubtitleById(id);
+    }
+  }
+
   /// 记下这个视频"怎么播"(与位置记忆同一节奏: 播放中每 5 秒 + 退出/切集时)。
   ///
   /// 只记**偏离默认**的部分: 倍速与全局默认一致时不写(否则以后改全局默认,
@@ -482,10 +522,15 @@ class VideoDetailController extends GetxController
     final ctr = plPlayerController;
     final speed = ctr.playbackSpeed;
     final vrOn = ctr.vrProjection.value != VrProjection.off;
+    // 字幕: 取 mpv **实际生效**的那条(不是我们记的索引), 面板上显示什么
+    // 就记什么; 播放器刚起来还没选好轨时 id 为空, 这时不写(保持默认策略)
+    final track = ctr.currentTrack.value.subtitle;
     LocalMediaMemory.put(
       uri,
       LocalMediaSettings(
         speed: (speed - Pref.playSpeedDefault).abs() > 0.01 ? speed : null,
+        subtitleId: track.id.isEmpty ? null : track.id,
+        subtitleTitle: track.title.isEmpty ? null : track.title,
         vrProjection: vrOn
             ? ctr.vrProjection.value
             : ctr.vrUserTouched
@@ -991,8 +1036,9 @@ class VideoDetailController extends GetxController
         if (!isLocalMedia) {
           setSubtitle(vttSubtitlesIndex.value);
         } else {
-          // 本地视频: 自动找同目录里与视频同名的外置字幕
-          unawaited(_autoloadLocalSubtitles());
+          // 本地视频: 自动找同目录里与视频同名的外置字幕, 加载完再把上次
+          // 记住的那条选回去(外置字幕必须先进 mpv 的列表才选得中)
+          unawaited(_autoloadLocalSubtitlesThenRestore());
           // 上次这个视频的倍速/眼位/视场角/陀螺仪(VR 布局在 setDataSource
           // 阶段就已经作为 hint 生效了)
           applyLocalSettingsMemory();

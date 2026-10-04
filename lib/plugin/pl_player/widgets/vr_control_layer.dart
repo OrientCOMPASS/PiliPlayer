@@ -76,7 +76,8 @@ class _VrControlLayerState extends State<VrControlLayer>
       (_) => _c.pollVrHudAngles(),
     );
     _gamepad.start();
-    _lookTicker.start();
+    // Ticker 不常驻: 只有摇杆偏出死区时才跑(见 _onGamepadSample),
+    // 否则暂停播放时也会一直泵帧, 白费电
   }
 
   @override
@@ -84,20 +85,30 @@ class _VrControlLayerState extends State<VrControlLayer>
     _hudTimer?.cancel();
     _hudTimer = null;
     _gamepad.stop();
-    _lookTicker.dispose();
+    _lookTicker
+      ..stop()
+      ..dispose();
     super.dispose();
   }
 
   void _onGamepadSample(double x, double y) {
     _axisX = x;
     _axisY = y;
+    // 死区内 = 摇杆没动: 停掉帧 Ticker(插值那边收敛完也会自己停)
+    final moving = GamepadMath.axis(x) != 0 || GamepadMath.axis(y) != 0;
+    if (moving && !_lookTicker.isActive) {
+      _lastFrame = Duration.zero;
+      _lookTicker.start();
+    } else if (!moving && _lookTicker.isActive) {
+      _lookTicker.stop();
+    }
   }
 
   void _onFrame(Duration elapsed) {
     final previous = _lastFrame;
     _lastFrame = elapsed;
-    if (_axisX == 0 && _axisY == 0) {
-      return; // 摇杆在死区里: 什么都不做(死区判定在 GamepadMath 里做过)
+    if (GamepadMath.axis(_axisX) == 0 && GamepadMath.axis(_axisY) == 0) {
+      return; // 摇杆在死区里: 什么都不做
     }
     if (previous == Duration.zero) {
       return; // 第一帧没有可靠的 dt
@@ -110,7 +121,9 @@ class _VrControlLayerState extends State<VrControlLayer>
   }
 
   void _onScaleStart(ScaleStartDetails details) {
-    _fovBase = _c.vrView.value.fov;
+    // 用目标值而不是"正在插值中的显示值"当基准: 否则连续捏合时基准一直在
+    // 追自己, 缩放会越捏越慢(第二十轮 需求4 引入插值后必须这么改)
+    _fovBase = _c.vrTargetFov;
     // 触屏操作唤醒控件(与播放器 UI 一致); 陀螺仪动作不产生触摸, 不唤醒
     _c.controls = true;
   }

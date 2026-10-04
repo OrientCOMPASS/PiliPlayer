@@ -26,6 +26,8 @@ class LocalMediaSettings {
     this.vrEye,
     this.vrFov,
     this.vrGyro,
+    this.subtitleId,
+    this.subtitleTitle,
   });
 
   /// 播放倍速; null = 跟随全局默认
@@ -43,10 +45,21 @@ class LocalMediaSettings {
   /// 陀螺仪环视
   final bool? vrGyro;
 
+  /// 上次生效的字幕轨 id(mpv 的 `sid`): `'no'`=关闭, `'auto'`=mpv 自选,
+  /// 其它是轨道号。null = 不记忆(下次仍按默认策略: 内嵌轨 mpv 自选 +
+  /// 没有内嵌轨时选第一个同名外置字幕)。
+  final String? subtitleId;
+
+  /// 上次那条字幕的标题。外置字幕的标题就是文件名, 比轨道号稳(轨道号会
+  /// 因为内嵌轨数量变化而漂移), 恢复时优先按标题找。
+  final String? subtitleTitle;
+
   bool get hasVr =>
       vrProjection != null || vrEye != null || vrFov != null || vrGyro != null;
 
-  bool get isEmpty => speed == null && !hasVr;
+  bool get hasSubtitle => subtitleId != null && subtitleId!.isNotEmpty;
+
+  bool get isEmpty => speed == null && !hasVr && !hasSubtitle;
 
   Map<String, dynamic> toJson() => <String, dynamic>{
     if (speed != null) 'speed': speed,
@@ -54,6 +67,8 @@ class LocalMediaSettings {
     if (vrEye != null) 'eye': vrEye!.name,
     if (vrFov != null) 'fov': vrFov,
     if (vrGyro != null) 'gyro': vrGyro,
+    if (subtitleId != null) 'sid': subtitleId,
+    if (subtitleTitle != null && subtitleTitle!.isNotEmpty) 'stitle': subtitleTitle,
   };
 
   static LocalMediaSettings? fromEncoded(Object? raw) {
@@ -72,12 +87,16 @@ class LocalMediaSettings {
     final speed = decoded['speed'];
     final fov = decoded['fov'];
     final gyro = decoded['gyro'];
+    final sid = decoded['sid'];
+    final stitle = decoded['stitle'];
     return LocalMediaSettings(
       speed: speed is num ? speed.toDouble() : null,
       vrProjection: _projectionOf(decoded['vr']),
       vrEye: _eyeOf(decoded['eye']),
       vrFov: fov is num ? fov.toDouble() : null,
       vrGyro: gyro is bool ? gyro : null,
+      subtitleId: sid is String && sid.isNotEmpty ? sid : null,
+      subtitleTitle: stitle is String && stitle.isNotEmpty ? stitle : null,
     );
   }
 
@@ -92,7 +111,7 @@ class LocalMediaSettings {
   @override
   String toString() =>
       'LocalMediaSettings(speed: $speed, vr: $vrProjection, eye: $vrEye, '
-      'fov: $vrFov, gyro: $vrGyro)';
+      'fov: $vrFov, gyro: $vrGyro, sid: $subtitleId/$subtitleTitle)';
 }
 
 /// 读写 [LocalMediaSettings]。

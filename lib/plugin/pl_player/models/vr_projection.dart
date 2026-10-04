@@ -280,18 +280,27 @@ class VrViewState {
     bool gyro = false,
   }) {
     return VrViewState(
-      yaw: _wrap180(yaw),
+      yaw: wrap180(yaw),
       pitch: pitch.clamp(-maxPitch, maxPitch),
       fov: fov.clamp(minFov, maxFov),
     );
   }
 
-  static double _wrap180(double value) {
+  /// 把角度回绕到 [-180, 180)
+  static double wrap180(double value) {
     var v = value % 360.0;
     if (v > 180.0) v -= 360.0;
     if (v < -180.0) v += 360.0;
     return v;
   }
+
+  /// 两个偏航角之间的**最短有向差**(结果落在 [-180, 180))。
+  ///
+  /// 360° 片源的偏航会不断回绕(…179° → -179°…), 插值时如果直接
+  /// `to - from` 会得到 -358°, 画面就沿着"远路"倒转一整圈。逐帧平滑
+  /// (第二十轮 需求4)必须按最短角路径走。
+  static double shortestDelta(double from, double to) => wrap180(to - from);
+
 
   VrViewState copyWith({double? yaw, double? pitch, double? fov}) => VrViewState(
     yaw: yaw ?? this.yaw,

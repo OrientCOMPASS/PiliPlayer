@@ -200,9 +200,7 @@ void main() {
 
     File touch(String dirName, String fileName, {String content = 'x'}) {
       final dir = Directory(p.join(root.path, dirName))..createSync(recursive: true);
-      final f = File(p.join(dir.path, fileName));
-      f.writeAsStringSync(content);
-      return f;
+      return File(p.join(dir.path, fileName))..writeAsStringSync(content);
     }
 
     test('Type2(DASH): 认出 video.m4s + audio.m4s', () {

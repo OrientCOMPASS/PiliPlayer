@@ -159,9 +159,10 @@ abstract final class DownloadExport {
 
   /// 从缓存条目解析出待导出的媒体流文件; 找不到完整视频流时返回 null。
   ///
-  /// 目录约定见 `DownloadService`: `<entryDir>/<typeTag>/{0.mp4 | video.m4s
-  /// + audio.m4s}`。优先按 entry.json 记录的 typeTag 找; 找不到再扫其余
-  /// 子目录兜底(typeTag 缺失、目录被搬动过时仍能命中)。
+  /// 目录约定见 `DownloadService`: 条目目录下按画质分子目录, 里面放
+  /// `0.mp4`(Type1) 或 `video.m4s` + `audio.m4s`(Type2)。优先按
+  /// entry.json 记录的 typeTag 找; 找不到再扫其余子目录兜底(typeTag
+  /// 缺失、目录被搬动过时仍能命中)。
   static DownloadMediaFiles? resolveMediaFiles(BiliDownloadEntryInfo entry) {
     final entryDir = Directory(entry.entryDirPath);
     if (!entryDir.existsSync()) {

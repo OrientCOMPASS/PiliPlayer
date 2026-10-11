@@ -212,6 +212,10 @@ class MainActivity : AudioServiceActivity() {
             }
         }
 
+        // B 站缓存「导出到本地」(第二十七轮): video.m4s + audio.m4s
+        // 经 MediaExtractor/MediaMuxer 流级合并写入系统「下载」目录。
+        MediaMuxExport.register(applicationContext, flutterEngine.dartExecutor.binaryMessenger)
+
         // 手柄摇杆是 MotionEvent 模拟轴, 不会自动进 Flutter 的按键通道;
         // 这里缓存最新读数, VR 操作模式下由 Dart 轮询(见 Gamepad / VrControlLayer)。
         MethodChannel(

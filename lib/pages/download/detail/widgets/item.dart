@@ -14,6 +14,7 @@ import 'package:PiliPlus/models_new/download/bili_download_entry_info.dart';
 import 'package:PiliPlus/pages/common/multi_select/base.dart';
 import 'package:PiliPlus/pages/download/downloading/view.dart';
 import 'package:PiliPlus/services/download/download_service.dart';
+import 'package:PiliPlus/services/download/export_service.dart';
 import 'package:PiliPlus/utils/cache_manager.dart';
 import 'package:PiliPlus/utils/duration_utils.dart';
 import 'package:PiliPlus/utils/extension/num_ext.dart';
@@ -66,6 +67,17 @@ class DetailItem extends StatelessWidget {
               clipBehavior: Clip.hardEdge,
               contentPadding: const EdgeInsets.symmetric(vertical: 12),
               children: [
+                if (DownloadExport.isSupported && entry.isCompleted)
+                  DialogOption(
+                    onPressed: () async {
+                      Get.back();
+                      await DownloadExport.exportEntry(entry);
+                    },
+                    child: const Text(
+                      '导出到本地',
+                      style: TextStyle(fontSize: 14),
+                    ),
+                  ),
                 DialogOption(
                   onPressed: () {
                     Get.back();

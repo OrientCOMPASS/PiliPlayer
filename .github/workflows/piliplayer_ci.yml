@@ -68,6 +68,8 @@ env:
         lib/services/smb/smb_session_pool.dart
         lib/plugin/pl_player/widgets/vr_control_layer.dart
         test/services/local_media_source_test.dart
+        lib/services/download/export_service.dart
+        test/services/download_export_test.dart
 
 jobs:
     check:

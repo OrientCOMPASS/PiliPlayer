@@ -70,7 +70,7 @@ task downloadDependencies(type: Exec) {
         // Download all *.jar dependencies & verify their sha256 checksums
         // (empty sha256 = verify not possible for rolling asset, log only).
         def filesToDownload = [
-            ["url": "https://github.com/OrientCOMPASS/PiliPlus/releases/download/libmpv-vr/default-arm64-v8a.jar", "sha256": "", "destination": file("$buildDir/libmpv-vr/default-arm64-v8a.jar")],
+            ["url": "https://github.com/OrientCOMPASS/PiliPlayer/releases/download/libmpv-vr/default-arm64-v8a.jar", "sha256": "", "destination": file("$buildDir/libmpv-vr/default-arm64-v8a.jar")],
             ["url": "https://github.com/My-Responsitories/libmpv-android-video-build/releases/download/20260906/default-armeabi-v7a.jar", "sha256": "75ba2199848cd6224817320ddfabb7d7ea48fb4cfb1721b0090043d5a8a38602", "destination": file("$buildDir/20260906/default-armeabi-v7a.jar")],
             ["url": "https://github.com/My-Responsitories/libmpv-android-video-build/releases/download/20260906/default-x86_64.jar", "sha256": "1caa6198de22808bd7f10fcff2923f5eb174cc42ef24569aeafb98c6597457a4", "destination": file("$buildDir/20260906/default-x86_64.jar")],
         ]

@@ -138,7 +138,9 @@ abstract final class DownloadExport {
   }
 
   static void _bindProgressHandler() {
-    if (_handlerBound) return;
+    if (_handlerBound) {
+      return;
+    }
     _handlerBound = true;
     _channel.setMethodCallHandler((call) {
       if (call.method == 'onExportProgress') {

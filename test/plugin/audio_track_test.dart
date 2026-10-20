@@ -44,7 +44,7 @@ void main() {
   });
 
   group('PlPlayerController.audioTrackLabel', () {
-    final tracks = [
+    const tracks = [
       AudioTrack('1', '国语', 'zh'),
       AudioTrack('2', '原声', 'ja'),
     ];

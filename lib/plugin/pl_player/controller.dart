@@ -793,6 +793,38 @@ class PlPlayerController with BlockConfigMixin, AudioNormalizationMixin {
     await _videoPlayerController?.setAudioTrack(track);
   }
 
+  /// 按轨道 id 切换内嵌音轨, 供底栏音轨按钮用
+  /// (view 层不必依赖 media_kit 的类型, 与 [selectInternalSubtitleById] 同约定)。
+  Future<void> selectInternalAudioById(String id) async {
+    for (final t in internalAudioTracks) {
+      if (t.id == id) {
+        await setInternalAudioTrack(AudioTrack(t.id, t.title, t.language));
+        return;
+      }
+    }
+  }
+
+  /// 当前生效音轨的展示名(底栏音轨按钮旁的标签)。
+  String currentAudioLabel() =>
+      audioTrackLabel(currentTrack.value.audio.id, internalAudioTracks);
+
+  /// 把「当前生效音轨 id」解析成展示名(纯函数, 可单测):
+  /// 命中轨道表给轨道名; auto/no/空/未知一律显示「自动」
+  /// (mpv 默认 aid=auto, 实际选中的就是列表里的第一条)。
+  static String audioTrackLabel(String currentId, List<AudioTrack> tracks) {
+    for (final t in tracks) {
+      if (t.id == currentId) {
+        return trackLabel(
+          id: t.id,
+          title: t.title,
+          language: t.language,
+          codec: t.codec,
+        );
+      }
+    }
+    return '自动';
+  }
+
   /// 按标题选中一条**刚加进去**的外挂字幕轨。
   ///
   /// media_kit 的 `setSubtitleTrack(SubtitleTrack.uri(...))` 走的是 mpv 的

@@ -933,6 +933,70 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
         },
       ),
 
+      /// 音轨: 片源带多条内嵌音轨时(本地影片常见: 国配/原声)给出快切按钮;
+      /// 单音轨片源(在线流、B 站缓存等)自动隐藏, 不占底栏位置。
+      BottomControlType.audioTrack => Obx(
+        () {
+          final audios = plPlayerController.internalAudioTracks;
+          if (audios.length <= 1) {
+            return const SizedBox.shrink();
+          }
+          final label = plPlayerController.currentAudioLabel();
+          final curId = plPlayerController.currentTrack.value.audio.id;
+          const itemStyle = TextStyle(color: Colors.white, fontSize: 13);
+          return PopupMenuButton<String>(
+            tooltip: '音轨',
+            requestFocus: false,
+            initialValue: switch (curId) {
+              '' || 'auto' || 'no' => null,
+              _ => curId,
+            },
+            color: Colors.black.withValues(alpha: 0.8),
+            itemBuilder: (context) => [
+              for (final t in audios)
+                PopupMenuItem<String>(
+                  value: t.id,
+                  height: 35,
+                  onTap: () => plPlayerController.selectInternalAudioById(t.id),
+                  child: Text(
+                    PlPlayerController.trackLabel(
+                      id: t.id,
+                      title: t.title,
+                      language: t.language,
+                      codec: t.codec,
+                    ),
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: itemStyle,
+                  ),
+                ),
+            ],
+            child: Padding(
+              padding: const EdgeInsets.symmetric(horizontal: 6),
+              child: Row(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.audiotrack, size: 20, color: Colors.white),
+                  const SizedBox(width: 3),
+                  ConstrainedBox(
+                    constraints: const BoxConstraints(maxWidth: 84),
+                    child: Text(
+                      label,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: const TextStyle(
+                        color: Colors.white,
+                        fontSize: 12,
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          );
+        },
+      ),
+
       /// 播放速度
       BottomControlType.speed => Obx(
         () => Tooltip(
@@ -1064,6 +1128,7 @@ class _PLVideoPlayerState extends State<PLVideoPlayer>
       if (flag) .fit,
       if (isNotFileSource) .aiTranslate,
       .subtitle,
+      .audioTrack,
       .speed,
       if (isNotFileSource && flag) .qa,
       if (!plPlayerController.isDesktopPip) .fullscreen,

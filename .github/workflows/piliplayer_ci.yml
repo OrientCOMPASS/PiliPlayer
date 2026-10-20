@@ -70,6 +70,7 @@ env:
         test/services/local_media_source_test.dart
         lib/services/download/export_service.dart
         test/services/download_export_test.dart
+        test/plugin/audio_track_test.dart
 
 jobs:
     check:

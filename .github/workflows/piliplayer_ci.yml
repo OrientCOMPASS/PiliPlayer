@@ -71,6 +71,7 @@ env:
         lib/services/download/export_service.dart
         test/services/download_export_test.dart
         test/plugin/audio_track_test.dart
+        test/pages/local_media_back_test.dart
 
 jobs:
     check:

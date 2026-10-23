@@ -11,6 +11,7 @@ import 'package:PiliPlus/models/common/msg/msg_unread_type.dart';
 import 'package:PiliPlus/models/common/nav_bar_config.dart';
 import 'package:PiliPlus/pages/dynamics/controller.dart';
 import 'package:PiliPlus/pages/home/controller.dart';
+import 'package:PiliPlus/pages/local_media/controller.dart';
 import 'package:PiliPlus/pages/mine/view.dart';
 import 'package:PiliPlus/services/account_service.dart';
 import 'package:PiliPlus/utils/extension/get_ext.dart';
@@ -314,6 +315,23 @@ class MainController extends GetxController
         ),
       );
     }
+  }
+
+  /// 第二十九轮: 「本地」Tab 正处于目录浏览/检索态时, 系统返回键先由
+  /// 本地板块消费(回上一级目录 -> 退出检索 -> 回到来源列表)。
+  /// 返回是否消费掉了这次返回; 未消费时按原有"跳回首个 Tab/退出"逻辑走。
+  bool consumeBackInLocalTab() {
+    final index = selectedIndex.value;
+    if (index < 0 || index >= navigationBars.length) {
+      return false;
+    }
+    if (navigationBars[index] != NavigationBarType.local) {
+      return false;
+    }
+    if (!Get.isRegistered<LocalMediaController>()) {
+      return false;
+    }
+    return Get.find<LocalMediaController>().handleBack();
   }
 
   void setIndex(int value) {

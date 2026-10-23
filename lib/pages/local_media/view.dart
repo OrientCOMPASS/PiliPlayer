@@ -1,5 +1,7 @@
+import 'package:PiliPlus/common/widgets/flutter/pop_scope.dart';
 import 'package:PiliPlus/http/loading_state.dart';
 import 'package:PiliPlus/models/local_media/local_media_source.dart';
+import 'package:PiliPlus/pages/local_media/browser.dart';
 import 'package:PiliPlus/pages/local_media/controller.dart';
 import 'package:PiliPlus/services/local_media_service.dart';
 import 'package:PiliPlus/services/smb/smb_discovery.dart';
@@ -18,7 +20,14 @@ import 'package:material_ui/material_ui.dart';
 ///     不再展示"连接过的主机"自动记录(那只是凭据备忘, 不进列表);
 ///   * 局域网: SMB 主机自动发现(尽力显示主机名) + 手动添加来源。
 class LocalMediaPage extends StatefulWidget {
-  const LocalMediaPage({super.key});
+  const LocalMediaPage({this.inTab = false, super.key});
+
+  /// 是否作为主导航「本地」Tab 使用(第二十九轮 Tab 内浏览):
+  /// * true —— 系统返回键由 MainApp 分发(MainController.consumeBackInLocalTab),
+  ///   本页不自挂 PopScope;
+  /// * false —— 作为独立路由打开('/localMedia', 从「我的」/离线缓存进入),
+  ///   浏览目录时返回键先逐级回退, 退出浏览后才 pop 本路由。
+  final bool inTab;
 
   @override
   State<LocalMediaPage> createState() => _LocalMediaPageState();
@@ -51,6 +60,40 @@ class _LocalMediaPageState extends State<LocalMediaPage>
   @override
   Widget build(BuildContext context) {
     super.build(context);
+    // 第二十九轮: 目录浏览内嵌在本板块里(不再推新路由),
+    // browseTarget 非空渲染内嵌浏览页, 否则渲染来源列表。
+    return Obx(() {
+      final target = _controller.browseTarget.value;
+      if (target != null) {
+        final browser = LocalMediaBrowserPage(
+          // target 的标识作 key: 换目录进入时重建 State, 不残留旧目录栈
+          key: ValueKey(target),
+          source: target.source,
+          path: target.path,
+          title: target.title,
+          initialItems: target.initialItems,
+          inTab: widget.inTab,
+        );
+        if (widget.inTab) {
+          return browser;
+        }
+        // 独立路由('/localMedia')拦截返回键: 先交给板块逐级回退;
+        // 退出浏览后本 PopScope 随 Obx 消失, 返回键恢复默认 pop 本路由
+        return popScope(
+          canPop: false,
+          onPopInvokedWithResult: (didPop, result) {
+            if (!didPop) {
+              _controller.handleBack();
+            }
+          },
+          child: browser,
+        );
+      }
+      return _buildSourceList(context);
+    });
+  }
+
+  Widget _buildSourceList(BuildContext context) {
     return Scaffold(
       primary: false,
       resizeToAvoidBottomInset: false,

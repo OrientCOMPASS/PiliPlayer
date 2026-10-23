@@ -1,6 +1,5 @@
 import 'dart:async' show Timer, unawaited;
 
-import 'package:PiliPlus/common/widgets/flutter/pop_scope.dart';
 import 'package:PiliPlus/common/widgets/loading_widget/http_error.dart';
 import 'package:PiliPlus/common/widgets/loading_widget/loading_widget.dart';
 import 'package:PiliPlus/common/widgets/scaffold/simple_scaffold.dart';
@@ -24,9 +23,11 @@ import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
 
-/// 目录浏览页: 从一个来源(本机目录 / SMB 共享 / WebDAV)的某个路径开始逐层浏览。
+/// 目录浏览视图: 从一个来源(本机目录 / SMB 共享 / WebDAV)的某个路径开始逐层浏览。
 ///
-/// 点一个视频就播放, 同目录的其他视频自动成为播放列表; 返回键逐层回退。
+/// 点一个视频就播放(**只有这一步推新路由**), 同目录的其他视频自动成为播放列表;
+/// 目录层级的前进/回退都发生在「本地」板块内部(第二十九轮: 本视图不再是
+/// 独立路由, 系统返回键由 LocalMediaController.handleBack 统一分发)。
 class LocalMediaBrowserPage extends StatefulWidget {
   const LocalMediaBrowserPage({
     super.key,
@@ -34,6 +35,7 @@ class LocalMediaBrowserPage extends StatefulWidget {
     required this.path,
     this.title,
     this.initialItems,
+    this.inTab = false,
   });
 
   final LocalMediaSource source;
@@ -42,6 +44,10 @@ class LocalMediaBrowserPage extends StatefulWidget {
 
   /// 已经取到的条目(例如从媒体库点进文件夹时), 可以避免再列一次目录
   final List<LocalMediaItem>? initialItems;
+
+  /// 是否作为主导航「本地」Tab 内嵌: Tab 外层已做过状态栏留白,
+  /// AppBar 需 primary:false 免得双重留白; 独立路由('/localMedia')保持默认。
+  final bool inTab;
 
   @override
   State<LocalMediaBrowserPage> createState() => _LocalMediaBrowserPageState();
@@ -69,6 +75,7 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
 
   @override
   void dispose() {
+    _mediaController?.unregisterBrowserBack(_back);
     _dlCancelled = true; // 页面都关了, 别让下载继续占着网络
     _dlDialogContext = null;
     // 浏览页都关了, 这一页导出过的 SAF fd 没有再被使用的可能
@@ -97,6 +104,8 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
     } else {
       _refresh();
     }
+    // 返回键回调挂载: Tab 内浏览由板块控制器统一分发(第二十九轮)
+    _mediaController?.registerBrowserBack(_back);
   }
 
   List<LocalMediaItem> get _items => _state.dataOrNull ?? const [];
@@ -269,120 +278,118 @@ class _LocalMediaBrowserPageState extends State<LocalMediaBrowserPage> {
 
   @override
   Widget build(BuildContext context) {
-    return popScope(
-      canPop: _stack.length <= 1 && !_searching,
-      onPopInvokedWithResult: (didPop, result) {
-        if (!didPop) {
-          _back();
-        }
-      },
-      child: SimpleScaffold(
-        appBar: AppBar(
-          // 第十九轮: 列表里不再有 ".." 这一行(它既占位置又容易被误点成
-          // 文件), 回上一级统一走 返回键 / 系统返回 / 面包屑。
-          leading: IconButton(
-            tooltip: _stack.length > 1 ? '上一级目录' : '返回',
-            icon: const Icon(Icons.arrow_back),
-            onPressed: () {
-              if (!_back()) {
-                Navigator.of(context).maybePop();
-              }
-            },
+    // 第二十九轮: 本视图不再是独立路由, 不再自带 PopScope —— 系统返回键
+    // 由「本地」板块统一分发(LocalMediaController.handleBack, 本 State 在
+    // initState/dispose 里注册/注销 _back)。
+    return SimpleScaffold(
+      appBar: AppBar(
+        // Tab 内嵌时外层已有状态栏留白, 这里不能再垫一次(第二十九轮)
+        primary: !widget.inTab,
+        // 第十九轮: 列表里不再有 ".." 这一行(它既占位置又容易被误点成
+        // 文件), 回上一级统一走 返回键 / 系统返回 / 面包屑。
+        leading: IconButton(
+          tooltip: _stack.length > 1 ? '上一级目录' : '返回',
+          icon: const Icon(Icons.arrow_back),
+          onPressed: () {
+            // 已在浏览根层: 退出浏览回来源列表(Tab 内浏览, 不再 pop 路由)
+            if (!_back()) {
+              _mediaController?.exitBrowse();
+            }
+          },
+        ),
+        bottom: _searching ? null : _buildBreadcrumb(),
+        title: _searching
+            ? TextField(
+                controller: _searchCtr,
+                autofocus: true,
+                onChanged: _onQueryChanged,
+                textInputAction: TextInputAction.search,
+                decoration: const InputDecoration(
+                  hintText: '检索本目录及子目录',
+                  border: InputBorder.none,
+                  isDense: true,
+                ),
+              )
+            : Text(
+                _current.title,
+                maxLines: 1,
+                overflow: TextOverflow.ellipsis,
+              ),
+        actions: [
+          IconButton(
+            tooltip: _searching ? '退出检索' : '检索(含子目录)',
+            onPressed: _searching ? _exitSearch : _enterSearch,
+            icon: Icon(_searching ? Icons.close : Icons.search),
           ),
-          bottom: _searching ? null : _buildBreadcrumb(),
-          title: _searching
-              ? TextField(
-                  controller: _searchCtr,
-                  autofocus: true,
-                  onChanged: _onQueryChanged,
-                  textInputAction: TextInputAction.search,
-                  decoration: const InputDecoration(
-                    hintText: '检索本目录及子目录',
-                    border: InputBorder.none,
-                    isDense: true,
-                  ),
-                )
-              : Text(
-                  _current.title,
-                  maxLines: 1,
-                  overflow: TextOverflow.ellipsis,
-                ),
-          actions: [
+          // 检索态下这些都只对浏览态有意义, 一并收起来
+          if (!_searching) ...[
+            // VLC 式书签: 浏览到常用目录时手动收藏, 而不是连接主机时被动弹窗。
+            // 刻意不用 Obx: 收藏状态只在点按后变化, setState 足够, 也避免
+            // 控制器没注册时 Obx 因为"没订阅到任何可观察对象"而报错。
             IconButton(
-              tooltip: _searching ? '退出检索' : '检索(含子目录)',
-              onPressed: _searching ? _exitSearch : _enterSearch,
-              icon: Icon(_searching ? Icons.close : Icons.search),
+              tooltip: _isBookmarked ? '已在快捷方式中' : '添加到快捷方式',
+              onPressed: _shortcut == null ? null : _addShortcut,
+              icon: Icon(
+                _isBookmarked
+                    ? Icons.bookmark_added_outlined
+                    : Icons.bookmark_add_outlined,
+              ),
             ),
-            // 检索态下这些都只对浏览态有意义, 一并收起来
-            if (!_searching) ...[
-              // VLC 式书签: 浏览到常用目录时手动收藏, 而不是连接主机时被动弹窗。
-              // 刻意不用 Obx: 收藏状态只在点按后变化, setState 足够, 也避免
-              // 控制器没注册时 Obx 因为"没订阅到任何可观察对象"而报错。
-              IconButton(
-                tooltip: _isBookmarked ? '已在快捷方式中' : '添加到快捷方式',
-                onPressed: _shortcut == null ? null : _addShortcut,
-                icon: Icon(
-                  _isBookmarked
-                      ? Icons.bookmark_added_outlined
-                      : Icons.bookmark_add_outlined,
-                ),
+            PopupMenuButton<LocalMediaSort>(
+              tooltip: '排序',
+              initialValue: _sort,
+              icon: const Icon(Icons.sort),
+              onSelected: (value) {
+                setState(() => _sort = value);
+                final current = _state.dataOrNull;
+                if (current != null) {
+                  setState(
+                    () => _state = Success(
+                      LocalMediaService.sortItems(current, value),
+                    ),
+                  );
+                }
+              },
+              itemBuilder: (context) => LocalMediaSort.values
+                  .map((e) => PopupMenuItem(value: e, child: Text(e.label)))
+                  .toList(),
+            ),
+            IconButton(
+              tooltip: _showHidden ? '隐藏隐藏文件' : '显示隐藏文件',
+              onPressed: () {
+                setState(() => _showHidden = !_showHidden);
+                _refresh();
+              },
+              icon: Icon(
+                _showHidden
+                    ? Icons.visibility_outlined
+                    : Icons.visibility_off_outlined,
               ),
-              PopupMenuButton<LocalMediaSort>(
-                tooltip: '排序',
-                initialValue: _sort,
-                icon: const Icon(Icons.sort),
-                onSelected: (value) {
-                  setState(() => _sort = value);
-                  final current = _state.dataOrNull;
-                  if (current != null) {
-                    setState(
-                      () => _state = Success(
-                        LocalMediaService.sortItems(current, value),
-                      ),
-                    );
-                  }
-                },
-                itemBuilder: (context) => LocalMediaSort.values
-                    .map((e) => PopupMenuItem(value: e, child: Text(e.label)))
-                    .toList(),
-              ),
-              IconButton(
-                tooltip: _showHidden ? '隐藏隐藏文件' : '显示隐藏文件',
-                onPressed: () {
-                  setState(() => _showHidden = !_showHidden);
-                  _refresh();
-                },
-                icon: Icon(
-                  _showHidden
-                      ? Icons.visibility_outlined
-                      : Icons.visibility_off_outlined,
-                ),
-              ),
-              IconButton(
-                tooltip: '刷新',
-                onPressed: _busy ? null : _refresh,
-                icon: const Icon(Icons.refresh),
-              ),
-            ],
-            const SizedBox(width: 6),
-          ],
-        ),
-        body: CustomScrollView(
-          slivers: [
-            ViewSliverSafeArea(
-              sliver: _searching
-                  ? _buildSearchSliver()
-                  : switch (_state) {
-                      Loading() => linearLoading,
-                      Error(:final errMsg) => HttpError(
-                        errMsg: errMsg,
-                        onReload: _refresh,
-                      ),
-                      Success() => _buildList(),
-                    },
+            ),
+            IconButton(
+              tooltip: '刷新',
+              onPressed: _busy ? null : _refresh,
+              icon: const Icon(Icons.refresh),
             ),
           ],
-        ),
+          const SizedBox(width: 6),
+        ],
+      ),
+      body: CustomScrollView(
+        slivers: [
+          ViewSliverSafeArea(
+            sliver: _searching
+                ? _buildSearchSliver()
+                : switch (_state) {
+                    Loading() => linearLoading,
+                    Error(:final errMsg) => HttpError(
+                      errMsg: errMsg,
+                      onReload: _refresh,
+                    ),
+                    Success() => _buildList(),
+                  },
+          ),
+        ],
       ),
     );
   }

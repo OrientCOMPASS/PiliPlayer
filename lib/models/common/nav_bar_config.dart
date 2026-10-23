@@ -35,7 +35,7 @@ enum NavigationBarType implements EnumWithLabel {
     '本地',
     Icon(Icons.video_library_outlined),
     Icon(Icons.video_library),
-    LocalMediaPage(),
+    LocalMediaPage(inTab: true),
   ),
   ;
 

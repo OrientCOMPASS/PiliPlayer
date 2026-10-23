@@ -100,6 +100,11 @@ class _MainAppState extends PopScopeState<MainApp>
 
   @override
   void onPopInvokedWithResult(bool didPop, Object? result) {
+    // 第二十九轮: 「本地」Tab 在目录浏览/检索态时, 返回键先由本地板块消费
+    // (逐级回退 -> 退出检索 -> 回来源列表), 未消费才走原有的跳 Tab/退出逻辑。
+    if (_mainController.consumeBackInLocalTab()) {
+      return;
+    }
     if (_mainController.directExitOnBack) {
       _onBack();
     } else {

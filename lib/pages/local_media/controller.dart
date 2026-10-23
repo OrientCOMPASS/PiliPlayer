@@ -3,7 +3,6 @@ import 'dart:async' show unawaited;
 import 'package:PiliPlus/http/loading_state.dart';
 import 'package:PiliPlus/models/local_media/local_media_item.dart';
 import 'package:PiliPlus/models/local_media/local_media_source.dart';
-import 'package:PiliPlus/pages/local_media/browser.dart';
 import 'package:PiliPlus/pages/local_media/widgets/smb_dialogs.dart';
 import 'package:PiliPlus/pages/local_media/widgets/source_editor.dart';
 import 'package:PiliPlus/services/local_media_service.dart';
@@ -14,6 +13,26 @@ import 'package:PiliPlus/services/smb/smb_name.dart';
 import 'package:flutter_smart_dialog/flutter_smart_dialog.dart';
 import 'package:get/get.dart';
 import 'package:material_ui/material_ui.dart';
+
+/// 一次「进入目录浏览」的目标(第二十九轮: 浏览不再推新路由, 内嵌在本板块)。
+///
+/// 实例标识(identity)直接用作内嵌浏览页的 ValueKey: 每次 [LocalMediaController.openBrowser]
+/// 都产生新实例, 保证浏览页 State 重建, 不残留上一次的目录栈/检索状态。
+class LocalBrowseTarget {
+  const LocalBrowseTarget({
+    required this.source,
+    required this.path,
+    this.title,
+    this.initialItems,
+  });
+
+  final LocalMediaSource source;
+  final String path;
+  final String? title;
+
+  /// 已取到的条目(如 SMB 主机的共享列表), 浏览页可省一次列目录
+  final List<LocalMediaItem>? initialItems;
+}
 
 /// 「本地」板块控制器(第十八轮改版): 不再做全盘扫描的"媒体库",
 /// 只负责 本机存储卷入口 + 用户收藏的快捷方式 + 局域网主机发现/来源管理。
@@ -51,6 +70,59 @@ class LocalMediaController extends GetxController {
   /// 部分访问下未勾选的文件对应用完全不可见, 用户会误以为"列表过滤了
   /// 我的文件"(第十三轮真机反馈), 必须明确提示。
   final RxnString accessNotice = RxnString();
+
+  // ==================== Tab 内目录浏览(第二十九轮) ====================
+  //
+  // 以前进任何目录都 Get.to 一个浏览路由; 现在浏览留在「本地」Tab 内
+  // (与首页/动态等板块一致), 只有点视频进播放页才推新路由。
+  // 浏览页(LocalMediaBrowserPage)内部自带目录栈, 这里只记录
+  // 「是否正处于浏览」, 并统一分发返回键。
+
+  /// 非 null = 正在 Tab 内浏览目录(LocalMediaPage 据此渲染内嵌浏览页)
+  final Rxn<LocalBrowseTarget> browseTarget = Rxn();
+
+  /// 进入目录浏览(替代原先的 Get.to(LocalMediaBrowserPage))
+  void openBrowser({
+    required LocalMediaSource source,
+    required String path,
+    String? title,
+    List<LocalMediaItem>? initialItems,
+  }) {
+    browseTarget.value = LocalBrowseTarget(
+      source: source,
+      path: path,
+      title: title,
+      initialItems: initialItems,
+    );
+  }
+
+  /// 退出浏览, 回到来源列表
+  void exitBrowse() => browseTarget.value = null;
+
+  bool Function()? _browserBack;
+
+  /// 内嵌浏览页挂载/卸载自己的返回键回调(回上一级目录 / 退出检索)
+  void registerBrowserBack(bool Function() handler) => _browserBack = handler;
+
+  void unregisterBrowserBack(bool Function() handler) {
+    if (identical(_browserBack, handler)) {
+      _browserBack = null;
+    }
+  }
+
+  /// 返回键统一分发: 先让浏览页消费(回上一级/退出检索); 它消费不了
+  /// (已在浏览根层)就退出浏览回到来源列表。返回是否消费掉了这次返回 —
+  /// 没消费时由外层(MainApp 的 Tab 分发 / 独立路由的 PopScope)按原逻辑处理。
+  bool handleBack() {
+    if (_browserBack?.call() ?? false) {
+      return true;
+    }
+    if (browseTarget.value != null) {
+      exitBrowse();
+      return true;
+    }
+    return false;
+  }
 
   @override
   void onInit() {
@@ -326,13 +398,11 @@ class LocalMediaController extends GetxController {
         uri: source.playbackBase,
         source: source,
       );
-      Get.to(
-        () => LocalMediaBrowserPage(
-          source: source,
-          path: '',
-          title: source.name,
-          initialItems: [item],
-        ),
+      openBrowser(
+        source: source,
+        path: '',
+        title: source.name,
+        initialItems: [item],
       );
       return;
     }
@@ -340,9 +410,7 @@ class LocalMediaController extends GetxController {
   }
 
   void _browse(LocalMediaSource source, String path, String title) {
-    Get.to(
-      () => LocalMediaBrowserPage(source: source, path: path, title: title),
-    );
+    openBrowser(source: source, path: path, title: title);
   }
 
   /// 连接一台发现的主机。
@@ -418,13 +486,11 @@ class LocalMediaController extends GetxController {
               isDirectory: true,
             ),
         ];
-        Get.to(
-          () => LocalMediaBrowserPage(
-            source: source,
-            path: '',
-            title: source.name,
-            initialItems: shares,
-          ),
+        openBrowser(
+          source: source,
+          path: '',
+          title: source.name,
+          initialItems: shares,
         );
         return;
       } on SmbException catch (e) {

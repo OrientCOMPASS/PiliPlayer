@@ -65,8 +65,9 @@ void main() {
       controller.openBrowser(source: source, path: '/a');
       bool backA() => true;
       bool backB() => true;
-      controller.registerBrowserBack(backA);
-      controller.unregisterBrowserBack(backB);
+      controller
+        ..registerBrowserBack(backA)
+        ..unregisterBrowserBack(backB);
       // backA 仍在: 返回键应被它消费, 不应退出浏览
       expect(controller.handleBack(), isTrue);
       expect(controller.browseTarget.value, isNotNull);
@@ -77,8 +78,9 @@ void main() {
     });
 
     test('exitBrowse 直接回来源列表, 之后返回键不再消费', () {
-      controller.openBrowser(source: source, path: '/a');
-      controller.exitBrowse();
+      controller
+        ..openBrowser(source: source, path: '/a')
+        ..exitBrowse();
       expect(controller.browseTarget.value, isNull);
       expect(controller.handleBack(), isFalse);
     });
@@ -86,8 +88,9 @@ void main() {
     test('两次 openBrowser 产生不同 target(内嵌页按 ValueKey 重建 State)', () {
       controller.openBrowser(source: source, path: '/a');
       final t1 = controller.browseTarget.value;
-      controller.exitBrowse();
-      controller.openBrowser(source: source, path: '/a');
+      controller
+        ..exitBrowse()
+        ..openBrowser(source: source, path: '/a');
       final t2 = controller.browseTarget.value;
       expect(identical(t1, t2), isFalse);
       expect(t2?.path, '/a');

@@ -50,6 +50,11 @@ class MainActivity : AudioServiceActivity() {
 
     private var pendingTreePick: MethodChannel.Result? = null
 
+    // ESC 翻译成 BACK 时 DOWN/UP 必须成对: 按下那一刻决定要不要翻译, 抬起无条件跟随。
+    // 否则「按住 ESC 中途再按 Ctrl」会让 BACK 只有 DOWN 没有 UP, Flutter 侧按键状态残留。
+    // 只在主线程(dispatchKeyEvent)读写。
+    private var escTranslatedDown = false
+
     override fun onConfigurationChanged(newConfig: Configuration) {
         super.onConfigurationChanged(newConfig)
         if (AndroidHelper.isFoldable) {
@@ -197,7 +202,7 @@ class MainActivity : AudioServiceActivity() {
                         result.error("bad_args", "uri required", null)
                     } else {
                         onWorker(result) {
-                            SafBrowser.releaseTree(contentResolver, Uri.parse(uriStr))
+                            SafBrowser.releaseTree(contentResolver, uriStr)
                         }
                     }
                 }
@@ -304,6 +309,37 @@ class MainActivity : AudioServiceActivity() {
     override fun dispatchKeyEvent(event: KeyEvent): Boolean {
         val keyCode = event.keyCode
 
+        // ==================== ESC = 返回键 ====================
+        // Android 9(P) 起 AOSP Generic.kcm 里 ESC 的 base 是 none: 单按不再兜底成
+        // BACK(Alt/Meta+Esc 仍兜底 HOME, Ctrl+Esc 仍兜底 MENU), 所以外接键盘的 ESC
+        // 在应用里默认毫无反应。这里在**应用内**自己翻译, 不动系统 kcm、不需要 root,
+        // 与下面手柄 B/C 走同一条已验证的通路(本应用预测式返回是关的:
+        // AndroidManifest 里 enableOnBackInvokedCallback="false")。
+        // 带 Ctrl/Alt/Meta 的组合不翻译, 保留系统原有的 HOME/MENU 语义。
+        if (keyCode == KeyEvent.KEYCODE_ESCAPE) {
+            val asBack = if (event.action == KeyEvent.ACTION_DOWN) {
+                !event.isCtrlPressed && !event.isAltPressed && !event.isMetaPressed
+            } else {
+                // UP / 其他动作跟随按下时的判定, 保证 BACK 的 DOWN/UP 成对
+                escTranslatedDown
+            }
+            if (asBack) {
+                if (event.action == KeyEvent.ACTION_DOWN) {
+                    // 长按 ESC 只当一次返回, 避免连续退栈
+                    if (event.repeatCount > 0) return true
+                    escTranslatedDown = true
+                } else if (event.action == KeyEvent.ACTION_UP) {
+                    escTranslatedDown = false
+                }
+                val backEvent = KeyEvent(
+                    event.downTime, event.eventTime, event.action,
+                    KeyEvent.KEYCODE_BACK, event.repeatCount, event.metaState,
+                    event.deviceId, event.scanCode, event.flags, event.source
+                )
+                return super.dispatchKeyEvent(backEvent)
+            }
+        }
+
         if (keyCode == KeyEvent.KEYCODE_BUTTON_B || keyCode == KeyEvent.KEYCODE_BUTTON_C) {
             val backEvent = KeyEvent(
                 event.downTime, event.eventTime, event.action,
@@ -315,9 +351,9 @@ class MainActivity : AudioServiceActivity() {
 
         if (keyCode == KeyEvent.KEYCODE_BUTTON_MODE || keyCode == KeyEvent.KEYCODE_BUTTON_START) {
             if (event.action == KeyEvent.ACTION_DOWN) {
-                moveTaskToBack(true) 
+                moveTaskToBack(true)
             }
-            return true 
+            return true
         }
 
         return super.dispatchKeyEvent(event)

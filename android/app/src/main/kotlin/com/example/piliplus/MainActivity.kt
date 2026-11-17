@@ -202,7 +202,7 @@ class MainActivity : AudioServiceActivity() {
                         result.error("bad_args", "uri required", null)
                     } else {
                         onWorker(result) {
-                            SafBrowser.releaseTree(contentResolver, uriStr)
+                            SafBrowser.releaseTree(contentResolver, Uri.parse(uriStr))   // ← 这里
                         }
                     }
                 }
